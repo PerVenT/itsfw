@@ -1,0 +1,39 @@
+# ==============================================================================
+# Strict Whitelist .gitignore: Ignore everything except explicitly allowed files
+# ==============================================================================
+
+# 1. Ignore everything by default
+*
+
+# 2. Allow Git to enter directories so deeper rules can match
+!*/
+
+# 3. Explicitly ignore build and cache directories
+/.cargo-cache/**
+/.superpowers/**
+/target/**
+/dist/**
+
+# 4. Whitelist root project configuration and documentation files
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/Dockerfile
+!/Makefile
+!/README.md
+
+# 5. Whitelist project source code and tests
+!/src/**
+!/tests/**
+
+# 6. Whitelist scripts and automation
+!/scripts/**
+
+# 7. Whitelist project documentation and specifications
+!/doc/**
+
+# 8. Whitelist CI/CD workflows and automation
+!/.github/**
+
+# 9. Whitelist visual assets (icons, logo)
+!/assets/**
