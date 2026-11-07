@@ -68,6 +68,38 @@ pub struct ListeningSocketInfo {
     pub app_path: String,
 }
 
+static LOOPBACK_PORT_OWNERS: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<(u16, String), String>>,
+> = std::sync::OnceLock::new();
+
+fn loopback_owners_map(
+) -> &'static std::sync::RwLock<std::collections::HashMap<(u16, String), String>> {
+    LOOPBACK_PORT_OWNERS.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Повертає ім'я локального процесу, який володіє вказаним портом (для 127.0.0.1 / ::1 з'єднань).
+pub fn lookup_loopback_peer(port: u16, protocol: &str) -> Option<String> {
+    let guard = loopback_owners_map().read().ok()?;
+    guard
+        .get(&(port, protocol.to_ascii_uppercase()))
+        .cloned()
+        .map(|name| format!("-> {}", name))
+}
+
+pub fn register_loopback_port_owner(port: u16, protocol: &str, owner: String, is_listener: bool) {
+    if port == 0 || owner.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = loopback_owners_map().write() {
+        let key = (port, protocol.to_ascii_uppercase());
+        if is_listener {
+            guard.insert(key, owner);
+        } else {
+            guard.entry(key).or_insert(owner);
+        }
+    }
+}
+
 /// Атрибутує вхідний пакет (dropped packet), віднесений WFP до системного процесу ("System" / ntoskrnl.exe),
 /// до реального процесу користувацького простору, який слухає відповідний (локальний_порт, протокол).
 pub fn attribute_inbound_drop_to_listener(
@@ -218,6 +250,9 @@ pub fn scan_listening_sockets() -> Vec<ListeningSocketInfo> {
             .then_with(|| a.protocol.cmp(&b.protocol))
     });
     sockets.dedup_by(|a, b| a.port == b.port && a.protocol == b.protocol && a.pid == b.pid);
+    for s in &sockets {
+        register_loopback_port_owner(s.port, &s.protocol, s.process_name.clone(), true);
+    }
     sockets
 }
 
@@ -265,25 +300,11 @@ pub fn scan_current_network_connections() -> Vec<NetworkEvent> {
                         continue;
                     }
 
-                    let remote_addr_u32 = row.dwRemoteAddr;
-                    if remote_addr_u32 == 0 {
-                        continue;
-                    }
-
+                    let local_port = u16::from_be(row.dwLocalPort as u16);
                     let path = pid_path_cache
                         .entry(pid)
                         .or_insert_with(|| get_process_path(pid));
                     if let Some(ref app_path) = path {
-                        let remote_ip = IpAddr::V4(Ipv4Addr::from(remote_addr_u32.to_be()));
-                        let remote_port = u16::from_be(row.dwRemotePort as u16);
-
-                        if remote_port == 0 || remote_ip == IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)) {
-                            continue;
-                        }
-
-                        let zone = Zone::classify(&remote_ip);
-                        let parent_name = process_tree.get(&pid).map(|p| p.parent_name.clone());
-
                         let app_name = std::path::Path::new(app_path)
                             .file_name()
                             .and_then(|n| n.to_str())
@@ -298,6 +319,33 @@ pub fn scan_current_network_connections() -> Vec<NetworkEvent> {
                         } else {
                             None
                         };
+                        let display_owner = match service_name.as_deref() {
+                            Some(svc) => format!("{} [{}]", app_name, svc),
+                            None => app_name.to_string(),
+                        };
+                        if local_port != 0 {
+                            register_loopback_port_owner(
+                                local_port,
+                                "TCP",
+                                display_owner,
+                                row.dwState == 2,
+                            );
+                        }
+
+                        let remote_addr_u32 = row.dwRemoteAddr;
+                        if remote_addr_u32 == 0 {
+                            continue;
+                        }
+
+                        let remote_ip = IpAddr::V4(Ipv4Addr::from(remote_addr_u32.to_be()));
+                        let remote_port = u16::from_be(row.dwRemotePort as u16);
+
+                        if remote_port == 0 || remote_ip == IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)) {
+                            continue;
+                        }
+
+                        let zone = Zone::classify(&remote_ip);
+                        let parent_name = process_tree.get(&pid).map(|p| p.parent_name.clone());
 
                         events.push(NetworkEvent {
                             timestamp: crate::core::monitor::current_timestamp_secs(),
@@ -783,5 +831,21 @@ mod tests {
             attribute_inbound_drop_to_listener(r"C:\MyApp\app.exe", 9999, "TCP", &listeners);
         assert_eq!(non_sys_path, r"C:\MyApp\app.exe");
         assert_eq!(non_sys_pid, 0);
+    }
+
+    #[test]
+    fn test_loopback_peer_lookup_and_listener_priority() {
+        register_loopback_port_owner(9146, "TCP", "client_ephemeral.exe".into(), false);
+        assert_eq!(
+            lookup_loopback_peer(9146, "tcp"),
+            Some("-> client_ephemeral.exe".into())
+        );
+
+        // Listener registration overrides non-listener entry on the same port
+        register_loopback_port_owner(9146, "TCP", "language_server.exe".into(), true);
+        assert_eq!(
+            lookup_loopback_peer(9146, "tcp"),
+            Some("-> language_server.exe".into())
+        );
     }
 }

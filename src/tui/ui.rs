@@ -601,7 +601,21 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 ("OK  ", palette.allowed_green)
             };
-            let domain = app.dns_resolver.resolve_or_enqueue(event.remote_ip);
+            let domain = if event.remote_ip.is_loopback() {
+                crate::core::scanner::lookup_loopback_peer(event.remote_port, &event.protocol)
+                    .or_else(|| {
+                        app.listening_sockets
+                            .iter()
+                            .find(|s| {
+                                s.port == event.remote_port
+                                    && s.protocol.eq_ignore_ascii_case(&event.protocol)
+                            })
+                            .map(|s| format!("-> {}", s.process_name))
+                    })
+                    .or_else(|| app.dns_resolver.resolve_or_enqueue(event.remote_ip))
+            } else {
+                app.dns_resolver.resolve_or_enqueue(event.remote_ip)
+            };
             let endpoint = crate::core::dns::format_recent_activity_endpoint(
                 &event.remote_ip,
                 event.remote_port,
