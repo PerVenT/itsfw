@@ -23,8 +23,10 @@ pub fn parse_ipconfig_displaydns(text: &str) -> HashMap<IpAddr, String> {
                     current_name = Some(domain);
                 }
             } else if let Ok(ip) = val.parse::<IpAddr>() {
-                if let Some(ref name) = current_name {
-                    map.insert(ip, name.clone());
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    if let Some(ref name) = current_name {
+                        map.insert(ip, name.clone());
+                    }
                 }
             }
         }
@@ -255,8 +257,15 @@ Windows IP Configuration
     Record Name . . . . . : ipv6.google.com
     Record Type . . . . . : 28
     AAAA Record . . . . . : 2a00:1450:4001:828::200e
+
+    cryptomator-vault
+    ----------------------------------------
+    Record Name . . . . . : cryptomator-vault
+    Record Type . . . . . : 1
+    A (Host) Record . . . : 127.0.0.1
 "#;
         let map = parse_ipconfig_displaydns(sample);
+        assert!(!map.contains_key(&IpAddr::from_str("127.0.0.1").unwrap()));
         assert_eq!(
             map.get(&IpAddr::from_str("140.82.121.6").unwrap())
                 .map(|s| s.as_str()),
