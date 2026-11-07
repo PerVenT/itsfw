@@ -28,11 +28,11 @@ fn fit_width(s: &str, width: usize) -> String {
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
-    // Головний вертикальний лейаут (v5): Шапка (1) -> Таблиця (100% Min) -> Нижній спліт (8) -> Футер (1)
+    // Головний вертикальний лейаут (v5): Шапка (3) -> Таблиця (100% Min) -> Нижній спліт (8) -> Футер (1)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(6),
             Constraint::Length(8),
             Constraint::Length(1),
@@ -78,7 +78,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut title_spans = vec![Span::styled(
-        "it's.fw",
+        " it's.fw",
         Style::default()
             .fg(palette.border_focus)
             .add_modifier(Modifier::BOLD),
@@ -138,7 +138,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let paragraph = Paragraph::new(Line::from(title_spans));
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette.border));
+    let paragraph = Paragraph::new(Line::from(title_spans)).block(header_block);
     f.render_widget(paragraph, area);
 }
 
@@ -525,51 +529,6 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
                         .fg(fw_sync_color)
                         .add_modifier(Modifier::BOLD),
                 ),
-            ]),
-            Line::from(vec![
-                Span::styled("Actions: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(
-                    "[a] ",
-                    Style::default()
-                        .fg(palette.allowed_green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("Allow  "),
-                Span::styled(
-                    "[l] ",
-                    Style::default()
-                        .fg(palette.lan_yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("LAN only  "),
-                Span::styled(
-                    "[i] ",
-                    Style::default()
-                        .fg(palette.internet_cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("Int only  "),
-                Span::styled(
-                    "[d] ",
-                    Style::default()
-                        .fg(palette.alert_red)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("Deny  "),
-                Span::styled(
-                    "[x] ",
-                    Style::default()
-                        .fg(palette.warning_orange)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("Reset  "),
-                Span::styled(
-                    "[Enter] ",
-                    Style::default()
-                        .fg(palette.internet_cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("Rule Builder"),
             ]),
         ];
 
