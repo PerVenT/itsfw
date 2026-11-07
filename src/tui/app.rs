@@ -294,6 +294,7 @@ impl App {
             FirewallDirection::Outbound => FirewallDirection::Inbound,
             FirewallDirection::Inbound => FirewallDirection::Outbound,
         };
+        self.sync_selection();
     }
 
     /// Фіксує знімок метрик активності (hits, last_hit_time), щоб список НЕ стрибав кожні 2 секунди під час перегляду.
@@ -368,7 +369,35 @@ impl App {
         let app_key = crate::core::rules::make_app_key(app_path, None, dir);
         self.active_rules
             .get(&app_key)
-            .or_else(|| self.active_rules.get(&app_path.to_lowercase()))
+            .or_else(|| {
+                self.active_rules
+                    .get(&app_path.to_lowercase())
+                    .filter(|r| r.service_name.is_none())
+            })
+    }
+
+    /// Визначає назву служби для заданого шляху: спершу перевіряє поточний виділений елемент,
+    /// а якщо він не збігається — шукає в агрегаторі запис для (app_path, active_direction) із service_name.
+    pub fn resolve_service_for_path(&self, app_path: &str) -> Option<String> {
+        let visible = self.visible_apps();
+        if let Some(selected_item) = visible.get(self.selected_index) {
+            if selected_item.app_path.eq_ignore_ascii_case(app_path) {
+                return selected_item.service_name.clone();
+            }
+        }
+        let target_dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
+        for entry in self.aggregator.get_sorted_list() {
+            if entry.direction == target_dir
+                && entry.app_path.eq_ignore_ascii_case(app_path)
+                && entry.service_name.is_some()
+            {
+                return entry.service_name.clone();
+            }
+        }
+        None
     }
 
     /// Фіксує курсор на вибраному додатку (`selected_app_path`), щоб список не стрибав при появі нових процесів.
@@ -616,7 +645,16 @@ impl App {
             FirewallDirection::Inbound => RuleDirection::Inbound,
         };
 
-        if let Some(existing) = self.rule_for_app(app_path).cloned() {
+        let svc = self.resolve_service_for_path(app_path);
+        let app_key = crate::core::rules::make_app_key(app_path, svc.as_deref(), active_rule_dir);
+
+        let existing = self
+            .active_rules
+            .get(&app_key)
+            .or_else(|| self.active_rules.get(&app_path.to_lowercase()))
+            .cloned();
+
+        if let Some(existing) = existing {
             self.edit_action = existing.action;
             self.edit_direction = existing.direction;
             self.edit_zone_scope = existing.zone_scope;
@@ -629,8 +667,8 @@ impl App {
                 NetProtocol::Udp => "UDP".into(),
                 NetProtocol::Any => "ANY".into(),
             };
-            self.edit_service_name = existing.service_name.clone();
-            self.edit_apply_to_service = existing.service_name.is_some();
+            self.edit_service_name = existing.service_name.clone().or_else(|| svc.clone());
+            self.edit_apply_to_service = self.edit_service_name.is_some();
         } else {
             self.edit_action = RuleAction::Allow;
             self.edit_direction = active_rule_dir;
@@ -638,8 +676,9 @@ impl App {
             self.edit_custom_ip_mode = false;
             self.edit_custom_ip = String::new();
             self.edit_remote_ip = None;
+            self.edit_service_name = svc.clone();
+            self.edit_apply_to_service = svc.is_some();
 
-            let app_key = crate::core::rules::make_app_key(app_path, None, active_rule_dir);
             let summary = self
                 .aggregator
                 .apps
@@ -647,8 +686,10 @@ impl App {
                 .or_else(|| self.aggregator.apps.get(&app_path.to_lowercase()));
 
             if let Some(summary) = summary {
-                self.edit_service_name = summary.service_name.clone();
-                self.edit_apply_to_service = summary.service_name.is_some();
+                if summary.service_name.is_some() {
+                    self.edit_service_name = summary.service_name.clone();
+                    self.edit_apply_to_service = true;
+                }
                 if let Some(last_ev) = summary.recent_events.last() {
                     self.edit_remote_ip = Some(last_ev.remote_ip.to_string());
                     self.edit_custom_ip = last_ev.remote_ip.to_string();
@@ -659,8 +700,6 @@ impl App {
                     self.edit_protocol = "TCP".into();
                 }
             } else {
-                self.edit_service_name = None;
-                self.edit_apply_to_service = false;
                 self.edit_ports = "80,443".into();
                 self.edit_protocol = "TCP".into();
             }
@@ -900,21 +939,24 @@ impl App {
         true
     }
 
-    /// Дозволяє вибраний додаток у LAN + Internet
-    pub fn allow_selected_all(&mut self, selected_app_path: &str) {
-        if !self.require_admin("Allow All") {
-            return;
-        }
+    fn apply_quick_rule(
+        &mut self,
+        selected_app_path: &str,
+        action: RuleAction,
+        zone_scope: AllowedZoneScope,
+        msg: &str,
+    ) {
         let dir = match self.active_direction {
             FirewallDirection::Outbound => RuleDirection::Outbound,
             FirewallDirection::Inbound => RuleDirection::Inbound,
         };
+        let svc = self.resolve_service_for_path(selected_app_path);
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
-            service_name: None,
+            service_name: svc,
             direction: dir,
-            action: RuleAction::Allow,
-            zone_scope: AllowedZoneScope::Both,
+            action,
+            zone_scope,
             custom_remote_ip: None,
             protocol: NetProtocol::Any,
             ports: "*".into(),
@@ -922,7 +964,20 @@ impl App {
             created_at: crate::core::monitor::current_timestamp_secs() as i64,
         };
 
-        self.apply_rule_internal(rule, "Allowed: LAN + Internet");
+        self.apply_rule_internal(rule, msg);
+    }
+
+    /// Дозволяє вибраний додаток у LAN + Internet
+    pub fn allow_selected_all(&mut self, selected_app_path: &str) {
+        if !self.require_admin("Allow All") {
+            return;
+        }
+        self.apply_quick_rule(
+            selected_app_path,
+            RuleAction::Allow,
+            AllowedZoneScope::Both,
+            "Allowed: LAN + Internet",
+        );
     }
 
     /// Дозволяє вибраний додаток ТІЛЬКИ в LAN
@@ -930,24 +985,12 @@ impl App {
         if !self.require_admin("Allow LAN Only") {
             return;
         }
-        let dir = match self.active_direction {
-            FirewallDirection::Outbound => RuleDirection::Outbound,
-            FirewallDirection::Inbound => RuleDirection::Inbound,
-        };
-        let rule = AppRule {
-            app_path: selected_app_path.to_string(),
-            service_name: None,
-            direction: dir,
-            action: RuleAction::Allow,
-            zone_scope: AllowedZoneScope::LanOnly,
-            custom_remote_ip: None,
-            protocol: NetProtocol::Any,
-            ports: "*".into(),
-            interface_name: None,
-            created_at: crate::core::monitor::current_timestamp_secs() as i64,
-        };
-
-        self.apply_rule_internal(rule, "Allowed: LAN Only");
+        self.apply_quick_rule(
+            selected_app_path,
+            RuleAction::Allow,
+            AllowedZoneScope::LanOnly,
+            "Allowed: LAN Only",
+        );
     }
 
     /// Дозволяє вибраний додаток ТІЛЬКИ в Інтернет (блокує LAN)
@@ -955,24 +998,12 @@ impl App {
         if !self.require_admin("Allow Internet Only") {
             return;
         }
-        let dir = match self.active_direction {
-            FirewallDirection::Outbound => RuleDirection::Outbound,
-            FirewallDirection::Inbound => RuleDirection::Inbound,
-        };
-        let rule = AppRule {
-            app_path: selected_app_path.to_string(),
-            service_name: None,
-            direction: dir,
-            action: RuleAction::Allow,
-            zone_scope: AllowedZoneScope::InternetOnly,
-            custom_remote_ip: None,
-            protocol: NetProtocol::Any,
-            ports: "*".into(),
-            interface_name: None,
-            created_at: crate::core::monitor::current_timestamp_secs() as i64,
-        };
-
-        self.apply_rule_internal(rule, "Allowed: Internet Only");
+        self.apply_quick_rule(
+            selected_app_path,
+            RuleAction::Allow,
+            AllowedZoneScope::InternetOnly,
+            "Allowed: Internet Only",
+        );
     }
 
     /// Дозволяє поточний порт, куди стукав додаток
@@ -994,10 +1025,11 @@ impl App {
             FirewallDirection::Outbound => RuleDirection::Outbound,
             FirewallDirection::Inbound => RuleDirection::Inbound,
         };
+        let svc = self.resolve_service_for_path(selected_app_path);
 
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
-            service_name: None,
+            service_name: svc,
             direction: dir,
             action: RuleAction::Allow,
             zone_scope: AllowedZoneScope::Both,
@@ -1017,24 +1049,12 @@ impl App {
         if !self.require_admin("Deny App") {
             return;
         }
-        let dir = match self.active_direction {
-            FirewallDirection::Outbound => RuleDirection::Outbound,
-            FirewallDirection::Inbound => RuleDirection::Inbound,
-        };
-        let rule = AppRule {
-            app_path: selected_app_path.to_string(),
-            service_name: None,
-            direction: dir,
-            action: RuleAction::Block,
-            zone_scope: AllowedZoneScope::Both,
-            custom_remote_ip: None,
-            protocol: NetProtocol::Any,
-            ports: "*".into(),
-            interface_name: None,
-            created_at: crate::core::monitor::current_timestamp_secs() as i64,
-        };
-
-        self.apply_rule_internal(rule, "DENY");
+        self.apply_quick_rule(
+            selected_app_path,
+            RuleAction::Block,
+            AllowedZoneScope::Both,
+            "DENY",
+        );
     }
 
     /// Скидає правило для додатка (Reset to default)
@@ -1049,13 +1069,17 @@ impl App {
             FirewallDirection::Outbound => RuleDirection::Outbound,
             FirewallDirection::Inbound => RuleDirection::Inbound,
         };
+        let svc = self.resolve_service_for_path(app_path);
         let key = app_path.to_lowercase();
-        let app_key = crate::core::rules::make_app_key(app_path, None, dir);
+        let app_key = crate::core::rules::make_app_key(app_path, svc.as_deref(), dir);
 
         #[cfg(windows)]
         {
             if let Ok(mgr) = WindowsFirewallManager::new() {
-                let _ = mgr.remove_app_rules_for(app_path, None, dir);
+                let _ = mgr.remove_app_rules_for(app_path, svc.as_deref(), dir);
+                if svc.is_some() {
+                    let _ = mgr.remove_app_rules_for(app_path, None, dir);
+                }
             }
         }
 
@@ -1065,6 +1089,16 @@ impl App {
         self.verified_fw_rules.remove(&app_key);
         self.aggregator.blocked_paths_or_names.remove(&key);
         self.aggregator.blocked_paths_or_names.remove(&app_key);
+
+        if svc.is_some() {
+            let base_key = crate::core::rules::make_app_key(app_path, None, dir);
+            self.active_rules.remove(&base_key);
+            self.verified_fw_rules.remove(&base_key);
+            self.aggregator.blocked_paths_or_names.remove(&base_key);
+            if let Some(app_item) = self.aggregator.apps.get_mut(&base_key) {
+                app_item.is_knocking = false;
+            }
+        }
 
         let filename = app_path
             .rsplit(['\\', '/'])
@@ -1235,8 +1269,10 @@ impl App {
             };
             match mgr.apply_rule(&params) {
                 Ok(_) => {
-                    self.verified_fw_rules
-                        .insert(key.clone(), params.name.clone());
+                    if rule.service_name.is_none() {
+                        self.verified_fw_rules
+                            .insert(key.clone(), params.name.clone());
+                    }
                     self.verified_fw_rules.insert(app_key.clone(), params.name);
                     self.set_status(format!("ENFORCED: {} (Windows Firewall)", success_text));
                 }
@@ -1250,8 +1286,10 @@ impl App {
         #[cfg(not(windows))]
         {
             let params = FirewallRuleParams::from_app_rule(&rule);
-            self.verified_fw_rules
-                .insert(key.clone(), params.name.clone());
+            if rule.service_name.is_none() {
+                self.verified_fw_rules
+                    .insert(key.clone(), params.name.clone());
+            }
             self.verified_fw_rules.insert(app_key.clone(), params.name);
             self.set_status(format!("ENFORCED: {}", success_text));
         }
@@ -1267,35 +1305,43 @@ impl App {
                 }
             }
         }
-        if let Some(app_item) = self.aggregator.apps.get_mut(&key) {
-            match rule.action {
-                RuleAction::Allow => {
-                    app_item.is_knocking = false;
-                }
-                RuleAction::Block => {
-                    app_item.is_knocking = true;
+        if rule.service_name.is_none() {
+            if let Some(app_item) = self.aggregator.apps.get_mut(&key) {
+                match rule.action {
+                    RuleAction::Allow => {
+                        app_item.is_knocking = false;
+                    }
+                    RuleAction::Block => {
+                        app_item.is_knocking = true;
+                    }
                 }
             }
         }
 
         match rule.action {
             RuleAction::Allow => {
-                self.aggregator.blocked_paths_or_names.remove(&key);
+                if rule.service_name.is_none() {
+                    self.aggregator.blocked_paths_or_names.remove(&key);
+                }
                 self.aggregator.blocked_paths_or_names.remove(&app_key);
-                if !filename.is_empty() {
+                if !filename.is_empty() && rule.service_name.is_none() {
                     self.aggregator.blocked_paths_or_names.remove(&filename);
                 }
             }
             RuleAction::Block => {
-                self.aggregator.blocked_paths_or_names.insert(key.clone());
+                if rule.service_name.is_none() {
+                    self.aggregator.blocked_paths_or_names.insert(key.clone());
+                }
                 self.aggregator.blocked_paths_or_names.insert(app_key.clone());
-                if !filename.is_empty() {
+                if !filename.is_empty() && rule.service_name.is_none() {
                     self.aggregator.blocked_paths_or_names.insert(filename);
                 }
             }
         }
 
-        self.active_rules.insert(key, rule.clone());
+        if rule.service_name.is_none() {
+            self.active_rules.insert(key, rule.clone());
+        }
         self.active_rules.insert(app_key, rule);
         self.sync_selection();
     }
@@ -1836,5 +1882,74 @@ mod tests {
         assert!(app.stream_paused);
         app.toggle_lockdown();
         assert!(app.lockdown_active);
+    }
+
+    #[test]
+    fn test_shared_service_disambiguation_and_direction_clamping() {
+        let mut app = App::new_with_privilege(true);
+        let path = r"C:\Windows\System32\svchost.exe";
+
+        // Record event for shared service
+        app.record_incoming_event(NetworkEvent {
+            timestamp: 100,
+            app_path: path.into(),
+            service_name: Some("Dnscache".into()),
+            direction: RuleDirection::Outbound,
+            process_id: 1234,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("8.8.8.8").unwrap(),
+            remote_port: 53,
+            protocol: "UDP".into(),
+            is_blocked: false,
+            zone: Zone::Internet,
+        });
+
+        app.sync_selection();
+        let visible = app.visible_apps();
+        assert_eq!(visible.len(), 1);
+        let item = &visible[0];
+        assert_eq!(item.service_name.as_deref(), Some("Dnscache"));
+
+        // Apply quick action [l] (LAN only)
+        app.allow_selected_lan_only(path);
+
+        // Verify rule is saved with service_name
+        let entry_rule = app
+            .rule_for_app_entry(item)
+            .expect("per-service rule should be found");
+        assert_eq!(entry_rule.service_name.as_deref(), Some("Dnscache"));
+        assert_eq!(entry_rule.zone_scope, AllowedZoneScope::LanOnly);
+
+        // Verify base rule_for_app (which looks up None service) does NOT match this per-service rule
+        assert!(app.rule_for_app(path).is_none());
+
+        // Verify reset_selected_rule removes the per-service rule
+        app.reset_selected_rule(path);
+        assert!(app.rule_for_app_entry(item).is_none());
+
+        // Test toggle_direction selection clamping
+        // Currently on Outbound with 1 item
+        app.selected_index = 5; // force out of bounds
+        app.toggle_direction(); // switches to Inbound (where visible_apps is empty)
+        assert_eq!(app.selected_index, 0);
+
+        // Add inbound item and test clamping when switching back
+        app.record_incoming_event(NetworkEvent {
+            timestamp: 101,
+            app_path: r"C:\App\server.exe".into(),
+            service_name: None,
+            direction: RuleDirection::Inbound,
+            process_id: 5678,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("192.168.1.50").unwrap(),
+            remote_port: 8080,
+            protocol: "TCP".into(),
+            is_blocked: false,
+            zone: Zone::Lan,
+        });
+        // On Inbound, we have 1 item. Set selected_index = 10
+        app.selected_index = 10;
+        app.toggle_direction(); // switches to Outbound (which has 1 item: svchost)
+        assert_eq!(app.selected_index, 0);
     }
 }

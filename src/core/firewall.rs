@@ -1305,8 +1305,15 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
             &format!("program={}", params.app_path),
         ]);
 
+        let dir_arg = match params.direction {
+            RuleDirection::Inbound => "dir=in",
+            RuleDirection::Outbound => "dir=out",
+        };
+
         // Якщо це правило Allow Internet Only: спочатку блокуємо доступ до LAN, потім дозволяємо any
-        if params.action == RuleAction::Allow && params.name.contains("[Allow:Internet]") {
+        if params.action == RuleAction::Allow
+            && (params.name.contains("[Allow:Internet]") || params.name.contains("[In:Allow:Internet]"))
+        {
             let block_lan_name = format!("{}: Block LAN", params.name);
             let _ = self.runner.execute(&[
                 "advfirewall",
@@ -1314,7 +1321,7 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
                 "add",
                 "rule",
                 &format!("name={}", block_lan_name),
-                "dir=out",
+                dir_arg,
                 "enable=yes",
                 "profile=any",
                 "action=block",
@@ -1324,7 +1331,9 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
         }
 
         // Якщо це правило Allow LAN Only: додатково блокуємо публічні IP Інтернету
-        if params.action == RuleAction::Allow && params.name.contains("[Allow:LAN]") {
+        if params.action == RuleAction::Allow
+            && (params.name.contains("[Allow:LAN]") || params.name.contains("[In:Allow:LAN]"))
+        {
             let block_inet_name = format!("{}: Block Internet", params.name);
             let _ = self.runner.execute(&[
                 "advfirewall",
@@ -1332,7 +1341,7 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
                 "add",
                 "rule",
                 &format!("name={}", block_inet_name),
-                "dir=out",
+                dir_arg,
                 "enable=yes",
                 "profile=any",
                 "action=block",
@@ -1757,6 +1766,40 @@ Ok.
             "remoteip={}",
             Zone::windows_firewall_lan_subnets()
         )));
+    }
+
+    #[test]
+    fn test_apply_rule_inbound_allow_lan_only_uses_dir_in() {
+        let runner = MockCommandRunner::default();
+        let mgr = WindowsFirewallManager::with_runner(runner.clone());
+
+        let rule = AppRule {
+            app_path: r"C:\Services\listener.exe".into(),
+            service_name: None,
+            direction: RuleDirection::Inbound,
+            action: RuleAction::Allow,
+            zone_scope: AllowedZoneScope::LanOnly,
+            custom_remote_ip: None,
+            protocol: NetProtocol::Tcp,
+            ports: "8080".into(),
+            interface_name: None,
+            created_at: 0,
+        };
+        let params = FirewallRuleParams::from_app_rule(&rule);
+
+        mgr.apply_rule(&params).expect("apply_rule should succeed");
+
+        let executed = runner.executed.lock().unwrap().clone();
+        assert_eq!(executed.len(), 3);
+        // Delete
+        assert_eq!(executed[0][2], "delete");
+        // Block Internet auxiliary rule must use dir=in
+        assert!(executed[1].contains(&"name=its.fw: listener.exe [In:Allow:LAN]: Block Internet".to_string()));
+        assert!(executed[1].contains(&"dir=in".to_string()));
+        assert!(executed[1].contains(&"action=block".to_string()));
+        // Allow rule must also use dir=in
+        assert!(executed[2].contains(&"name=its.fw: listener.exe [In:Allow:LAN]".to_string()));
+        assert!(executed[2].contains(&"dir=in".to_string()));
     }
 
     #[test]

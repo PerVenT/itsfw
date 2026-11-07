@@ -246,7 +246,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                 .map(|(idx, item)| {
                     let is_selected = idx == app.selected_index;
 
-                    let configured_rule = app.rule_for_app(&item.app_path);
+                    let configured_rule = app.rule_for_app_entry(item);
                     let is_explicit_block_rule = configured_rule
                         .map(|r| r.action == crate::core::rules::RuleAction::Block)
                         .unwrap_or(false);
@@ -382,7 +382,7 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             }
         };
 
-        let configured_rule = app.rule_for_app(&selected_app.app_path);
+        let configured_rule = app.rule_for_app_entry(selected_app);
         let is_explicit_block_rule = configured_rule
             .map(|r| r.action == crate::core::rules::RuleAction::Block)
             .unwrap_or(false);
