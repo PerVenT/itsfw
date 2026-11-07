@@ -68,6 +68,36 @@ pub struct ListeningSocketInfo {
     pub app_path: String,
 }
 
+/// Атрибутує вхідний пакет (dropped packet), віднесений WFP до системного процесу ("System" / ntoskrnl.exe),
+/// до реального процесу користувацького простору, який слухає відповідний (локальний_порт, протокол).
+pub fn attribute_inbound_drop_to_listener(
+    app_path: &str,
+    local_port: u16,
+    protocol: &str,
+    listeners: &[ListeningSocketInfo],
+) -> (String, u32) {
+    let lower_path = app_path.to_ascii_lowercase();
+    let is_system = lower_path == "system"
+        || lower_path.ends_with("ntoskrnl.exe")
+        || lower_path.ends_with(r"\ntoskrnl.exe");
+
+    let matching_listener = listeners.iter().find(|l| {
+        l.port == local_port && l.protocol.eq_ignore_ascii_case(protocol)
+    });
+
+    if is_system {
+        if let Some(l) = matching_listener {
+            return (l.app_path.clone(), l.pid);
+        }
+    } else if let Some(l) = matching_listener {
+        if l.app_path.eq_ignore_ascii_case(app_path) || lower_path.is_empty() {
+            return (l.app_path.clone(), l.pid);
+        }
+    }
+
+    (app_path.to_string(), 0)
+}
+
 /// Сканує всі активні сокети у стані LISTEN (TCP MIB_TCP_STATE_LISTEN та UDP).
 #[cfg(windows)]
 pub fn scan_listening_sockets() -> Vec<ListeningSocketInfo> {
@@ -202,6 +232,7 @@ pub fn scan_current_network_connections() -> Vec<NetworkEvent> {
     let mut events = Vec::new();
     let mut pid_path_cache: HashMap<u32, Option<String>> = HashMap::new();
     let process_tree = crate::core::process::get_process_tree_snapshot();
+    let services_by_pid = crate::core::process::get_running_services_by_pid();
 
     unsafe {
         // 1. Скануємо TCP
@@ -253,9 +284,24 @@ pub fn scan_current_network_connections() -> Vec<NetworkEvent> {
                         let zone = Zone::classify(&remote_ip);
                         let parent_name = process_tree.get(&pid).map(|p| p.parent_name.clone());
 
+                        let app_name = std::path::Path::new(app_path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
+                        let service_name = if crate::core::process::is_shared_service_host(app_name) {
+                            services_by_pid.get(&pid).and_then(|svcs| {
+                                let (_, svc) = crate::core::process::format_app_display_name(app_name, svcs);
+                                svc
+                            })
+                        } else {
+                            None
+                        };
+
                         events.push(NetworkEvent {
                             timestamp: crate::core::monitor::current_timestamp_secs(),
                             app_path: app_path.clone(),
+                            service_name,
+                            direction: crate::core::rules::RuleDirection::Outbound,
                             process_id: pid,
                             parent_process_name: parent_name,
                             remote_ip,
@@ -424,6 +470,8 @@ impl WfpDropMonitor {
         };
 
         let mut dropped_events = Vec::new();
+        let mut listeners_cache: Option<Vec<ListeningSocketInfo>> = None;
+        let mut services_cache: Option<HashMap<u32, Vec<crate::core::process::ServiceInfo>>> = None;
         let now_ft = unsafe { GetSystemTimeAsFileTime() };
         let now_u64 = filetime_to_u64(now_ft);
         if now_u64 <= self.last_poll_filetime {
@@ -468,7 +516,8 @@ impl WfpDropMonitor {
                         continue;
                     }
 
-                    // Перевіряємо, що це саме вихідний трафік (Outbound), а не вхідний фоновий шум з мережі
+                    // Визначаємо напрямок трафіку: Outbound або Inbound
+                    let mut direction = crate::core::rules::RuleDirection::Outbound;
                     if ev.r#type == FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
                         let drop_ptr = ev.Anonymous.classifyDrop;
                         if !drop_ptr.is_null() {
@@ -477,8 +526,13 @@ impl WfpDropMonitor {
                                 continue;
                             }
                             // FWP_DIRECTION_OUTBOUND = 0, MS_FWP_DIRECTION_OUT = 0x3901 (14593)
+                            // FWP_DIRECTION_INBOUND = 1, MS_FWP_DIRECTION_IN = 0x3900 (14592)
                             let dir = drop_info.msFwpDirection;
-                            if dir != 0 && dir != 0x3901 {
+                            if dir == 0 || dir == 0x3901 {
+                                direction = crate::core::rules::RuleDirection::Outbound;
+                            } else if dir == 1 || dir == 0x3900 {
+                                direction = crate::core::rules::RuleDirection::Inbound;
+                            } else {
                                 continue;
                             }
                         }
@@ -516,7 +570,11 @@ impl WfpDropMonitor {
                         continue;
                     };
 
-                    let remote_port = ev.header.remotePort;
+                    let port = match direction {
+                        crate::core::rules::RuleDirection::Outbound => ev.header.remotePort,
+                        crate::core::rules::RuleDirection::Inbound => ev.header.localPort,
+                    };
+
                     if remote_ip.is_unspecified()
                         || remote_ip.is_loopback()
                         || remote_ip.is_multicast()
@@ -524,15 +582,39 @@ impl WfpDropMonitor {
                         continue;
                     }
 
+                    let (final_path, final_pid) = if direction == crate::core::rules::RuleDirection::Inbound {
+                        let listeners = listeners_cache.get_or_insert_with(scan_listening_sockets);
+                        attribute_inbound_drop_to_listener(&app_path, port, &protocol, listeners)
+                    } else {
+                        (app_path, 0)
+                    };
+
+                    let mut service_name = None;
+                    if final_pid > 0 {
+                        let services = services_cache.get_or_insert_with(crate::core::process::get_running_services_by_pid);
+                        if let Some(svcs) = services.get(&final_pid) {
+                            let app_name = std::path::Path::new(&final_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("");
+                            if crate::core::process::is_shared_service_host(app_name) {
+                                let (_, svc) = crate::core::process::format_app_display_name(app_name, svcs);
+                                service_name = svc;
+                            }
+                        }
+                    }
+
                     let zone = Zone::classify(&remote_ip);
 
                     dropped_events.push(NetworkEvent {
                         timestamp: crate::core::monitor::current_timestamp_secs(),
-                        app_path,
-                        process_id: 0,
+                        app_path: final_path,
+                        service_name,
+                        direction,
+                        process_id: final_pid,
                         parent_process_name: None,
                         remote_ip,
-                        remote_port,
+                        remote_port: port,
                         protocol,
                         is_blocked: true,
                         zone,
@@ -652,5 +734,52 @@ mod tests {
             assert!(s.protocol == "TCP" || s.protocol == "UDP");
             assert!(!s.process_name.is_empty());
         }
+    }
+
+    #[test]
+    fn test_attribute_inbound_drop_to_listener_maps_system_to_owning_socket() {
+        let listeners = vec![ListeningSocketInfo {
+            port: 3000,
+            protocol: "TCP".into(),
+            pid: 4242,
+            process_name: "node.exe".into(),
+            app_path: r"C:\Program Files\nodejs\node.exe".into(),
+        }];
+        let (resolved_path, pid) = attribute_inbound_drop_to_listener(
+            r"C:\Windows\System32\ntoskrnl.exe",
+            3000,
+            "TCP",
+            &listeners,
+        );
+        assert_eq!(resolved_path, r"C:\Program Files\nodejs\node.exe");
+        assert_eq!(pid, 4242);
+    }
+
+    #[test]
+    fn test_attribute_inbound_drop_to_listener_unknown_port_returns_fallback() {
+        let listeners = vec![ListeningSocketInfo {
+            port: 80,
+            protocol: "TCP".into(),
+            pid: 100,
+            process_name: "httpd.exe".into(),
+            app_path: r"C:\Apache\httpd.exe".into(),
+        }];
+        let (resolved_path, pid) = attribute_inbound_drop_to_listener(
+            r"C:\Windows\System32\ntoskrnl.exe",
+            9999,
+            "TCP",
+            &listeners,
+        );
+        assert_eq!(resolved_path, r"C:\Windows\System32\ntoskrnl.exe");
+        assert_eq!(pid, 0);
+
+        let (non_sys_path, non_sys_pid) = attribute_inbound_drop_to_listener(
+            r"C:\MyApp\app.exe",
+            9999,
+            "TCP",
+            &listeners,
+        );
+        assert_eq!(non_sys_path, r"C:\MyApp\app.exe");
+        assert_eq!(non_sys_pid, 0);
     }
 }

@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct NetworkEvent {
     pub timestamp: u64,
     pub app_path: String,
+    pub service_name: Option<String>,
+    pub direction: crate::core::rules::RuleDirection,
     pub process_id: u32,
     pub parent_process_name: Option<String>,
     pub remote_ip: IpAddr,
@@ -22,6 +24,8 @@ pub struct NetworkEvent {
 pub struct AppActivitySummary {
     pub app_path: String,
     pub app_name: String,
+    pub service_name: Option<String>,
+    pub direction: crate::core::rules::RuleDirection,
     pub process_id: u32,
     pub parent_process_name: Option<String>,
     pub total_hits: u64,
@@ -119,13 +123,18 @@ impl EventAggregator {
         self.blocked_paths_or_names.clear();
 
         for (key, rule) in rules {
-            let filename = rule
+            let base_filename = rule
                 .app_path
                 .rsplit(['\\', '/'])
                 .next()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&rule.app_path)
                 .to_string();
+
+            let filename = match rule.service_name.as_deref() {
+                Some(svc) if !svc.trim().is_empty() => format!("{} [{}]", base_filename, svc.trim()),
+                _ => base_filename,
+            };
 
             let is_blocked = rule.action == crate::core::rules::RuleAction::Block;
             if is_blocked {
@@ -139,6 +148,8 @@ impl EventAggregator {
                 .or_insert_with(|| AppActivitySummary {
                     app_path: rule.app_path.clone(),
                     app_name: filename,
+                    service_name: rule.service_name.clone(),
+                    direction: rule.direction,
                     process_id: 0,
                     parent_process_name: None,
                     total_hits: 0,
@@ -160,6 +171,10 @@ impl EventAggregator {
                     recent_events: Vec::new(),
                 });
             entry.is_knocking = is_blocked;
+            entry.direction = rule.direction;
+            if entry.service_name.is_none() && rule.service_name.is_some() {
+                entry.service_name = rule.service_name.clone();
+            }
         }
     }
 
@@ -192,6 +207,8 @@ impl EventAggregator {
                     AppActivitySummary {
                         app_path: blocked_item,
                         app_name: filename,
+                        service_name: None,
+                        direction: crate::core::rules::RuleDirection::Outbound,
                         process_id: 0,
                         parent_process_name: None,
                         total_hits: 0,
@@ -217,7 +234,7 @@ impl EventAggregator {
     }
 
     pub fn record_event(&mut self, event: NetworkEvent) {
-        let app_name = event
+        let base_name = event
             .app_path
             .rsplit(['\\', '/'])
             .next()
@@ -225,12 +242,24 @@ impl EventAggregator {
             .unwrap_or("unknown.exe")
             .to_string();
 
-        let is_fw_blocked = self.is_app_blocked(&event.app_path, &app_name);
-        let key = event.app_path.to_lowercase();
+        let app_name = match event.service_name {
+            Some(ref s) if !s.trim().is_empty() => format!("{} [{}]", base_name, s.trim()),
+            _ => base_name.clone(),
+        };
+
+        let key = crate::core::rules::make_app_key(
+            &event.app_path,
+            event.service_name.as_deref(),
+            event.direction,
+        );
+        let is_fw_blocked = self.is_app_blocked(&event.app_path, &base_name)
+            || self.blocked_paths_or_names.contains(&key.to_lowercase());
 
         let entry = self.apps.entry(key).or_insert_with(|| AppActivitySummary {
             app_path: event.app_path.clone(),
             app_name: app_name.clone(),
+            service_name: event.service_name.clone(),
+            direction: event.direction,
             process_id: event.process_id,
             parent_process_name: event.parent_process_name.clone(),
             total_hits: 0,
@@ -281,6 +310,8 @@ impl EventAggregator {
                 .to_lowercase()
                 .cmp(&b.app_name.to_lowercase())
                 .then_with(|| a.app_path.to_lowercase().cmp(&b.app_path.to_lowercase()))
+                .then_with(|| (a.direction as u8).cmp(&(b.direction as u8)))
+                .then_with(|| a.service_name.cmp(&b.service_name))
         });
         list
     }
@@ -305,6 +336,8 @@ mod tests {
         let event1 = NetworkEvent {
             timestamp: 100,
             app_path: r"C:\Windows\System32\svchost.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 1234,
             parent_process_name: Some("services.exe".into()),
             remote_ip: IpAddr::from_str("192.168.1.1").unwrap(),
@@ -317,6 +350,8 @@ mod tests {
         let event2 = NetworkEvent {
             timestamp: 150,
             app_path: r"C:\Program Files\Telegram\telegram.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 5678,
             parent_process_name: Some("explorer.exe".into()),
             remote_ip: IpAddr::from_str("149.154.167.50").unwrap(),
@@ -345,6 +380,8 @@ mod tests {
         aggregator.record_event(NetworkEvent {
             timestamp: 100,
             app_path: r"C:\Apps\zeta.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 10,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),
@@ -357,6 +394,8 @@ mod tests {
         aggregator.record_event(NetworkEvent {
             timestamp: 200,
             app_path: r"C:\Apps\alpha.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 20,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("192.168.1.1").unwrap(),
@@ -377,6 +416,8 @@ mod tests {
         aggregator.record_event(NetworkEvent {
             timestamp: 999,
             app_path: r"C:\Apps\zeta.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 10,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),
@@ -402,6 +443,8 @@ mod tests {
         aggregator.record_event(NetworkEvent {
             timestamp: 100,
             app_path: path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 100,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("127.0.0.1").unwrap(),
@@ -420,6 +463,8 @@ mod tests {
         aggregator.record_event(NetworkEvent {
             timestamp: 105,
             app_path: path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 100,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("142.250.180.174").unwrap(),
@@ -431,6 +476,8 @@ mod tests {
         aggregator.record_event(NetworkEvent {
             timestamp: 106,
             app_path: path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 100,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("8.8.8.8").unwrap(),
@@ -456,6 +503,8 @@ mod tests {
             aggregator.record_event(NetworkEvent {
                 timestamp: 1000 + i,
                 app_path: path.into(),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Outbound,
                 process_id: 500,
                 parent_process_name: None,
                 remote_ip: IpAddr::from_str("10.0.0.1").unwrap(),
@@ -539,6 +588,8 @@ mod tests {
         let mut empty_summary = AppActivitySummary {
             app_path: r"C:\Apps\dummy.exe".into(),
             app_name: "dummy.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 1,
             parent_process_name: None,
             total_hits: 0,
@@ -582,6 +633,8 @@ mod tests {
         aggregator.record_event(NetworkEvent {
             timestamp: 10,
             app_path: app_path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 123,
             parent_process_name: None,
             remote_ip: "1.1.1.1".parse().unwrap(),
@@ -618,5 +671,76 @@ mod tests {
         let inactive = aggregator.apps.get(r"c:\inactive\blocked.exe").unwrap();
         assert!(inactive.is_knocking);
         assert_eq!(inactive.app_name, "blocked.exe");
+    }
+
+    #[test]
+    fn test_aggregator_separates_services_and_directions() {
+        let mut agg = EventAggregator::new();
+        agg.record_event(NetworkEvent {
+            timestamp: 10,
+            app_path: r"C:\Windows\System32\svchost.exe".into(),
+            service_name: Some("Dnscache".into()),
+            direction: crate::core::rules::RuleDirection::Outbound,
+            process_id: 100,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("8.8.8.8").unwrap(),
+            remote_port: 53,
+            protocol: "UDP".into(),
+            is_blocked: false,
+            zone: Zone::Internet,
+        });
+        agg.record_event(NetworkEvent {
+            timestamp: 11,
+            app_path: r"C:\Windows\System32\svchost.exe".into(),
+            service_name: Some("DiagTrack".into()),
+            direction: crate::core::rules::RuleDirection::Outbound,
+            process_id: 200,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("20.190.159.1").unwrap(),
+            remote_port: 443,
+            protocol: "TCP".into(),
+            is_blocked: true,
+            zone: Zone::Internet,
+        });
+        assert_eq!(agg.apps.len(), 2, "Different Windows services in svchost.exe must have distinct entries");
+    }
+
+    #[test]
+    fn test_aggregator_separates_inbound_and_outbound() {
+        let mut agg = EventAggregator::new();
+        let app_path = r"C:\Tools\listener.exe";
+        agg.record_event(NetworkEvent {
+            timestamp: 10,
+            app_path: app_path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
+            process_id: 100,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),
+            remote_port: 443,
+            protocol: "TCP".into(),
+            is_blocked: false,
+            zone: Zone::Internet,
+        });
+        agg.record_event(NetworkEvent {
+            timestamp: 12,
+            app_path: app_path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Inbound,
+            process_id: 100,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("192.168.1.50").unwrap(),
+            remote_port: 8080,
+            protocol: "TCP".into(),
+            is_blocked: true,
+            zone: Zone::Lan,
+        });
+        assert_eq!(agg.apps.len(), 2, "Inbound and Outbound for same binary must have distinct entries");
+        let out_key = crate::core::rules::make_app_key(app_path, None, crate::core::rules::RuleDirection::Outbound);
+        let in_key = crate::core::rules::make_app_key(app_path, None, crate::core::rules::RuleDirection::Inbound);
+        assert!(agg.apps.contains_key(&out_key));
+        assert!(agg.apps.contains_key(&in_key));
+        assert!(!agg.apps.get(&out_key).unwrap().is_knocking);
+        assert!(agg.apps.get(&in_key).unwrap().is_knocking);
     }
 }

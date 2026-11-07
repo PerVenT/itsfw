@@ -1158,6 +1158,8 @@ mod tests {
         app.aggregator.record_event(NetworkEvent {
             timestamp: 100,
             app_path: app_path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 1024,
             parent_process_name: Some("services.exe".into()),
             remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),

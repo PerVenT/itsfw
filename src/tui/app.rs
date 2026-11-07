@@ -768,6 +768,8 @@ mod tests {
         app.aggregator.record_event(NetworkEvent {
             timestamp: 100,
             app_path: app_path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 42,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("8.8.8.8").unwrap(),
@@ -816,6 +818,8 @@ mod tests {
         app.aggregator.record_event(NetworkEvent {
             timestamp: 100,
             app_path: r"C:\Apps\mu.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 1,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),
@@ -827,6 +831,8 @@ mod tests {
         app.aggregator.record_event(NetworkEvent {
             timestamp: 100,
             app_path: r"C:\Apps\zeta.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 2,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),
@@ -845,6 +851,8 @@ mod tests {
         app.aggregator.record_event(NetworkEvent {
             timestamp: 200,
             app_path: r"C:\Apps\alpha.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 3,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),
@@ -889,6 +897,8 @@ mod tests {
         app.aggregator.record_event(NetworkEvent {
             timestamp: 200,
             app_path: knocking_path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 4321,
             parent_process_name: Some("shell.exe".into()),
             remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),
@@ -929,6 +939,8 @@ mod tests {
             app.aggregator.record_event(NetworkEvent {
                 timestamp: 100,
                 app_path: format!(r"C:\Apps\{}", name),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Outbound,
                 process_id: 1,
                 parent_process_name: None,
                 remote_ip: IpAddr::from_str("127.0.0.1").unwrap(),
@@ -990,6 +1002,8 @@ mod tests {
             app.aggregator.record_event(NetworkEvent {
                 timestamp: 100,
                 app_path: format!(r"C:\Services\{}", name),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Outbound,
                 process_id: 1,
                 parent_process_name: None,
                 remote_ip: IpAddr::from_str("10.0.0.1").unwrap(),
@@ -1031,6 +1045,8 @@ mod tests {
         app.aggregator.record_event(NetworkEvent {
             timestamp: 100,
             app_path: r"C:\Apps\alpha.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 1,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("192.168.1.1").unwrap(),
@@ -1043,6 +1059,8 @@ mod tests {
             app.aggregator.record_event(NetworkEvent {
                 timestamp: ts,
                 app_path: r"C:\Apps\beta.exe".into(),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Outbound,
                 process_id: 2,
                 parent_process_name: None,
                 remote_ip: IpAddr::from_str("8.8.8.8").unwrap(),
@@ -1070,6 +1088,8 @@ mod tests {
             app.aggregator.record_event(NetworkEvent {
                 timestamp: ts,
                 app_path: r"C:\Apps\alpha.exe".into(),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Outbound,
                 process_id: 1,
                 parent_process_name: None,
                 remote_ip: IpAddr::from_str("192.168.1.1").unwrap(),
@@ -1177,6 +1197,8 @@ mod tests {
         app.aggregator.record_event(NetworkEvent {
             timestamp: 100,
             app_path: path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
             process_id: 999,
             parent_process_name: None,
             remote_ip: IpAddr::from_str("93.184.216.34").unwrap(),
