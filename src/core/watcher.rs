@@ -93,7 +93,8 @@ fn run_watcher_loop(tx: Sender<FirewallWatchEvent>, last_self_mutation_ms: Arc<A
     let subkey =
         w!("SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy");
 
-    let open_res = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, 0, KEY_NOTIFY, &mut hkey) };
+    let open_res =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, Some(0), KEY_NOTIFY, &mut hkey) };
 
     if open_res.is_err() {
         return;
@@ -105,7 +106,7 @@ fn run_watcher_loop(tx: Sender<FirewallWatchEvent>, last_self_mutation_ms: Arc<A
                 hkey,
                 true,
                 REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
-                HANDLE::default(),
+                Some(HANDLE::default()),
                 false,
             )
         };

@@ -279,7 +279,8 @@ fn query_file_description(app_path: &str) -> Option<String> {
     }
 
     let mut data = vec![0u8; size as usize];
-    let ok = unsafe { GetFileVersionInfoW(&wide_path, 0, size, data.as_mut_ptr() as *mut c_void) };
+    let ok =
+        unsafe { GetFileVersionInfoW(&wide_path, Some(0), size, data.as_mut_ptr() as *mut c_void) };
     if ok.is_err() {
         return None;
     }
@@ -436,9 +437,10 @@ fn verify_catalog_signature(app_path: &str, wide_path: &windows::core::HSTRING) 
         let mut h_cat_admin: isize = 0;
         let acquired = unsafe {
             if use_sha256 {
-                CryptCATAdminAcquireContext2(&mut h_cat_admin, None, w!("SHA256"), None, 0).is_ok()
+                CryptCATAdminAcquireContext2(&mut h_cat_admin, None, w!("SHA256"), None, Some(0))
+                    .is_ok()
             } else {
-                CryptCATAdminAcquireContext(&mut h_cat_admin, None, 0).is_ok()
+                CryptCATAdminAcquireContext(&mut h_cat_admin, None, Some(0)).is_ok()
             }
         };
         if !acquired || h_cat_admin == 0 {
@@ -447,7 +449,7 @@ fn verify_catalog_signature(app_path: &str, wide_path: &windows::core::HSTRING) 
 
         let mut hash_len: u32 = 0;
         let _ = unsafe {
-            CryptCATAdminCalcHashFromFileHandle2(h_cat_admin, h_file, &mut hash_len, None, 0)
+            CryptCATAdminCalcHashFromFileHandle2(h_cat_admin, h_file, &mut hash_len, None, Some(0))
         };
         if hash_len == 0 {
             unsafe {
@@ -463,7 +465,7 @@ fn verify_catalog_signature(app_path: &str, wide_path: &windows::core::HSTRING) 
                 h_file,
                 &mut hash_len,
                 Some(hash_buf.as_mut_ptr()),
-                0,
+                Some(0),
             )
             .is_ok()
         };
@@ -476,7 +478,7 @@ fn verify_catalog_signature(app_path: &str, wide_path: &windows::core::HSTRING) 
         hash_buf.truncate(hash_len as usize);
 
         let h_cat_info =
-            unsafe { CryptCATAdminEnumCatalogFromHash(h_cat_admin, &hash_buf, 0, None) };
+            unsafe { CryptCATAdminEnumCatalogFromHash(h_cat_admin, &hash_buf, Some(0), None) };
         if h_cat_info == 0 {
             unsafe {
                 let _ = CryptCATAdminReleaseContext(h_cat_admin, 0);

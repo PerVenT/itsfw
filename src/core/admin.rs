@@ -1,7 +1,7 @@
 //! Перевірка наявності адміністративних привілеїв у Windows.
 
 #[cfg(windows)]
-use windows::Win32::Foundation::BOOL;
+use windows::core::BOOL;
 #[cfg(windows)]
 use windows::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, WinBuiltinAdministratorsSid, PSID,
@@ -18,7 +18,7 @@ pub fn is_running_as_admin() -> bool {
         let created = CreateWellKnownSid(
             WELL_KNOWN_SID_TYPE(WinBuiltinAdministratorsSid.0),
             None,
-            PSID(admin_sid.as_mut_ptr() as *mut _),
+            Some(PSID(admin_sid.as_mut_ptr() as *mut _)),
             &mut sid_size,
         );
 

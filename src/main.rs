@@ -81,7 +81,10 @@ fn run_app<B: ratatui::backend::Backend>(
     app: &mut App,
     wfp_monitor: &mut WfpDropMonitor,
     watcher: &crate::core::watcher::FirewallRegistryWatcher,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    io::Error: From<B::Error>,
+{
     let mut last_scan = std::time::Instant::now();
 
     loop {

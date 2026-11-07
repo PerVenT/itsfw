@@ -533,18 +533,20 @@ impl ComFirewallBackend {
         use windows::core::Interface;
         use windows::Win32::NetworkManagement::WindowsFirewall::INetFwRule;
         use windows::Win32::System::Ole::IEnumVARIANT;
-        use windows::Win32::System::Variant::{VariantChangeType, VAR_CHANGE_FLAGS, VT_UNKNOWN};
+        use windows::Win32::System::Variant::{
+            VariantChangeType, VARIANT, VAR_CHANGE_FLAGS, VT_UNKNOWN,
+        };
 
         if let Ok(unk) = rules._NewEnum() {
             if let Ok(enum_var) = unk.cast::<IEnumVARIANT>() {
                 loop {
-                    let mut var = [windows::core::VARIANT::default()];
+                    let mut var = [VARIANT::default()];
                     let mut fetched = 0u32;
                     let hr = enum_var.Next(&mut var, &mut fetched);
                     if hr.is_err() || fetched == 0 {
                         break;
                     }
-                    let mut unk_var = windows::core::VARIANT::default();
+                    let mut unk_var = VARIANT::default();
                     if VariantChangeType(&mut unk_var, &var[0], VAR_CHANGE_FLAGS(0), VT_UNKNOWN)
                         .is_ok()
                     {
