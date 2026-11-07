@@ -192,15 +192,13 @@ fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Right => {
                             app.editor_cycle_option(true);
                         }
-                        KeyCode::Char(' ') => {
-                            match app.edit_focused_field {
-                                crate::tui::app::RuleEditorField::CustomIp
-                                | crate::tui::app::RuleEditorField::Ports => {}
-                                _ => {
-                                    app.editor_cycle_option(true);
-                                }
+                        KeyCode::Char(' ') => match app.edit_focused_field {
+                            crate::tui::app::RuleEditorField::CustomIp
+                            | crate::tui::app::RuleEditorField::Ports => {}
+                            _ => {
+                                app.editor_cycle_option(true);
                             }
-                        }
+                        },
                         KeyCode::Enter => {
                             app.save_prefilled_rule();
                         }
@@ -208,7 +206,9 @@ fn run_app<B: ratatui::backend::Backend>(
                             app.delete_rule_from_editor();
                         }
                         KeyCode::Char('d')
-                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
                             app.delete_rule_from_editor();
                         }
@@ -386,7 +386,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                 crate::core::rules::RuleDirection::Inbound
                             }
                         };
-                        let os_rules = crate::core::firewall::WindowsFirewallManager::load_rules_from_os(dir);
+                        let os_rules =
+                            crate::core::firewall::WindowsFirewallManager::load_rules_from_os(dir);
                         let count = os_rules.len();
                         app.sync_from_os_rules(os_rules);
                         for drop_ev in wfp_monitor.poll_dropped_events() {

@@ -132,7 +132,9 @@ impl EventAggregator {
                 .to_string();
 
             let filename = match rule.service_name.as_deref() {
-                Some(svc) if !svc.trim().is_empty() => format!("{} [{}]", base_filename, svc.trim()),
+                Some(svc) if !svc.trim().is_empty() => {
+                    format!("{} [{}]", base_filename, svc.trim())
+                }
                 _ => base_filename,
             };
 
@@ -702,7 +704,11 @@ mod tests {
             is_blocked: true,
             zone: Zone::Internet,
         });
-        assert_eq!(agg.apps.len(), 2, "Different Windows services in svchost.exe must have distinct entries");
+        assert_eq!(
+            agg.apps.len(),
+            2,
+            "Different Windows services in svchost.exe must have distinct entries"
+        );
     }
 
     #[test]
@@ -735,9 +741,21 @@ mod tests {
             is_blocked: true,
             zone: Zone::Lan,
         });
-        assert_eq!(agg.apps.len(), 2, "Inbound and Outbound for same binary must have distinct entries");
-        let out_key = crate::core::rules::make_app_key(app_path, None, crate::core::rules::RuleDirection::Outbound);
-        let in_key = crate::core::rules::make_app_key(app_path, None, crate::core::rules::RuleDirection::Inbound);
+        assert_eq!(
+            agg.apps.len(),
+            2,
+            "Inbound and Outbound for same binary must have distinct entries"
+        );
+        let out_key = crate::core::rules::make_app_key(
+            app_path,
+            None,
+            crate::core::rules::RuleDirection::Outbound,
+        );
+        let in_key = crate::core::rules::make_app_key(
+            app_path,
+            None,
+            crate::core::rules::RuleDirection::Inbound,
+        );
         assert!(agg.apps.contains_key(&out_key));
         assert!(agg.apps.contains_key(&in_key));
         assert!(!agg.apps.get(&out_key).unwrap().is_knocking);

@@ -81,9 +81,9 @@ pub fn attribute_inbound_drop_to_listener(
         || lower_path.ends_with("ntoskrnl.exe")
         || lower_path.ends_with(r"\ntoskrnl.exe");
 
-    let matching_listener = listeners.iter().find(|l| {
-        l.port == local_port && l.protocol.eq_ignore_ascii_case(protocol)
-    });
+    let matching_listener = listeners
+        .iter()
+        .find(|l| l.port == local_port && l.protocol.eq_ignore_ascii_case(protocol));
 
     if is_system {
         if let Some(l) = matching_listener {
@@ -288,9 +288,11 @@ pub fn scan_current_network_connections() -> Vec<NetworkEvent> {
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("");
-                        let service_name = if crate::core::process::is_shared_service_host(app_name) {
+                        let service_name = if crate::core::process::is_shared_service_host(app_name)
+                        {
                             services_by_pid.get(&pid).and_then(|svcs| {
-                                let (_, svc) = crate::core::process::format_app_display_name(app_name, svcs);
+                                let (_, svc) =
+                                    crate::core::process::format_app_display_name(app_name, svcs);
                                 svc
                             })
                         } else {
@@ -582,7 +584,9 @@ impl WfpDropMonitor {
                         continue;
                     }
 
-                    let (final_path, final_pid) = if direction == crate::core::rules::RuleDirection::Inbound {
+                    let (final_path, final_pid) = if direction
+                        == crate::core::rules::RuleDirection::Inbound
+                    {
                         let listeners = listeners_cache.get_or_insert_with(scan_listening_sockets);
                         attribute_inbound_drop_to_listener(&app_path, port, &protocol, listeners)
                     } else {
@@ -591,14 +595,16 @@ impl WfpDropMonitor {
 
                     let mut service_name = None;
                     if final_pid > 0 {
-                        let services = services_cache.get_or_insert_with(crate::core::process::get_running_services_by_pid);
+                        let services = services_cache
+                            .get_or_insert_with(crate::core::process::get_running_services_by_pid);
                         if let Some(svcs) = services.get(&final_pid) {
                             let app_name = std::path::Path::new(&final_path)
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("");
                             if crate::core::process::is_shared_service_host(app_name) {
-                                let (_, svc) = crate::core::process::format_app_display_name(app_name, svcs);
+                                let (_, svc) =
+                                    crate::core::process::format_app_display_name(app_name, svcs);
                                 service_name = svc;
                             }
                         }
@@ -773,12 +779,8 @@ mod tests {
         assert_eq!(resolved_path, r"C:\Windows\System32\ntoskrnl.exe");
         assert_eq!(pid, 0);
 
-        let (non_sys_path, non_sys_pid) = attribute_inbound_drop_to_listener(
-            r"C:\MyApp\app.exe",
-            9999,
-            "TCP",
-            &listeners,
-        );
+        let (non_sys_path, non_sys_pid) =
+            attribute_inbound_drop_to_listener(r"C:\MyApp\app.exe", 9999, "TCP", &listeners);
         assert_eq!(non_sys_path, r"C:\MyApp\app.exe");
         assert_eq!(non_sys_pid, 0);
     }

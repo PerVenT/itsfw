@@ -500,23 +500,27 @@ impl ComFirewallBackend {
         Ok(Self)
     }
 
-    fn policy(&self) -> anyhow::Result<windows::Win32::NetworkManagement::WindowsFirewall::INetFwPolicy2> {
-        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    fn policy(
+        &self,
+    ) -> anyhow::Result<windows::Win32::NetworkManagement::WindowsFirewall::INetFwPolicy2> {
         use windows::Win32::NetworkManagement::WindowsFirewall::NetFwPolicy2;
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
         unsafe {
             let policy = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)?;
             Ok(policy)
         }
     }
 
-    unsafe fn for_each_rule<F: FnMut(&windows::Win32::NetworkManagement::WindowsFirewall::INetFwRule)>(
+    unsafe fn for_each_rule<
+        F: FnMut(&windows::Win32::NetworkManagement::WindowsFirewall::INetFwRule),
+    >(
         rules: &windows::Win32::NetworkManagement::WindowsFirewall::INetFwRules,
         mut f: F,
     ) {
         use windows::core::Interface;
+        use windows::Win32::NetworkManagement::WindowsFirewall::INetFwRule;
         use windows::Win32::System::Ole::IEnumVARIANT;
         use windows::Win32::System::Variant::{VariantChangeType, VAR_CHANGE_FLAGS, VT_UNKNOWN};
-        use windows::Win32::NetworkManagement::WindowsFirewall::INetFwRule;
 
         if let Ok(unk) = rules._NewEnum() {
             if let Ok(enum_var) = unk.cast::<IEnumVARIANT>() {
@@ -528,7 +532,9 @@ impl ComFirewallBackend {
                         break;
                     }
                     let mut unk_var = windows::core::VARIANT::default();
-                    if VariantChangeType(&mut unk_var, &var[0], VAR_CHANGE_FLAGS(0), VT_UNKNOWN).is_ok() {
+                    if VariantChangeType(&mut unk_var, &var[0], VAR_CHANGE_FLAGS(0), VT_UNKNOWN)
+                        .is_ok()
+                    {
                         if let Ok(item_unk) = windows::core::IUnknown::try_from(&unk_var) {
                             if let Ok(fw_rule) = item_unk.cast::<INetFwRule>() {
                                 f(&fw_rule);
@@ -543,14 +549,12 @@ impl ComFirewallBackend {
     fn add_single_rule(&self, params: &FirewallRuleParams) -> anyhow::Result<()> {
         use windows::core::BSTR;
         use windows::Win32::Foundation::VARIANT_TRUE;
-        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
         use windows::Win32::NetworkManagement::WindowsFirewall::{
-            NetFwRule, INetFwRule,
-            NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK,
-            NET_FW_RULE_DIR_IN, NET_FW_RULE_DIR_OUT,
+            INetFwRule, NetFwRule, NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK,
             NET_FW_IP_PROTOCOL_ANY, NET_FW_IP_PROTOCOL_TCP, NET_FW_IP_PROTOCOL_UDP,
-            NET_FW_PROFILE2_ALL,
+            NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN, NET_FW_RULE_DIR_OUT,
         };
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
         let policy = self.policy()?;
         unsafe {
@@ -625,8 +629,8 @@ impl FirewallBackend for ComFirewallBackend {
 
     fn set_outbound_blocking(&self, block: bool) -> anyhow::Result<()> {
         use windows::Win32::NetworkManagement::WindowsFirewall::{
-            NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK,
-            NET_FW_PROFILE2_DOMAIN, NET_FW_PROFILE2_PRIVATE, NET_FW_PROFILE2_PUBLIC,
+            NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK, NET_FW_PROFILE2_DOMAIN,
+            NET_FW_PROFILE2_PRIVATE, NET_FW_PROFILE2_PUBLIC,
         };
         let policy = self.policy()?;
         let action = if block {
@@ -665,7 +669,11 @@ impl FirewallBackend for ComFirewallBackend {
         let policy = self.policy()?;
         unsafe {
             let val = if active { VARIANT_TRUE } else { VARIANT_FALSE };
-            for profile in [NET_FW_PROFILE2_DOMAIN, NET_FW_PROFILE2_PRIVATE, NET_FW_PROFILE2_PUBLIC] {
+            for profile in [
+                NET_FW_PROFILE2_DOMAIN,
+                NET_FW_PROFILE2_PRIVATE,
+                NET_FW_PROFILE2_PUBLIC,
+            ] {
                 policy.put_BlockAllInboundTraffic(profile, val)?;
                 if active {
                     policy.put_DefaultOutboundAction(profile, NET_FW_ACTION_BLOCK)?;
@@ -684,9 +692,8 @@ impl FirewallBackend for ComFirewallBackend {
     fn load_rules(&self, direction: RuleDirection) -> std::collections::HashMap<String, AppRule> {
         use windows::Win32::Foundation::VARIANT_TRUE;
         use windows::Win32::NetworkManagement::WindowsFirewall::{
-            NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK,
-            NET_FW_RULE_DIR_IN, NET_FW_RULE_DIR_OUT,
-            NET_FW_IP_PROTOCOL_TCP, NET_FW_IP_PROTOCOL_UDP,
+            NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK, NET_FW_IP_PROTOCOL_TCP,
+            NET_FW_IP_PROTOCOL_UDP, NET_FW_RULE_DIR_IN, NET_FW_RULE_DIR_OUT,
         };
         let mut map: std::collections::HashMap<String, AppRule> = std::collections::HashMap::new();
         if let Ok(policy) = self.policy() {
@@ -711,12 +718,19 @@ impl FirewallBackend for ComFirewallBackend {
                         if name.ends_with(": Block LAN") || name.ends_with(": Block Internet") {
                             return;
                         }
-                        let prog = r.ApplicationName().map(|b| b.to_string()).unwrap_or_default();
+                        let prog = r
+                            .ApplicationName()
+                            .map(|b| b.to_string())
+                            .unwrap_or_default();
                         let svc = r.ServiceName().map(|b| b.to_string()).unwrap_or_default();
                         if prog.is_empty() && svc.is_empty() {
                             return;
                         }
-                        let svc_opt = if svc.is_empty() { None } else { Some(svc.clone()) };
+                        let svc_opt = if svc.is_empty() {
+                            None
+                        } else {
+                            Some(svc.clone())
+                        };
 
                         let action = match r.Action() {
                             Ok(NET_FW_ACTION_ALLOW) => RuleAction::Allow,
@@ -731,14 +745,19 @@ impl FirewallBackend for ComFirewallBackend {
                             || name.starts_with(LEGACY_FIREWALL_RULE_GROUP);
 
                         if action == RuleAction::Block || is_its_fw {
-                            let remote_ip = r.RemoteAddresses().map(|b| b.to_string()).unwrap_or_default();
+                            let remote_ip = r
+                                .RemoteAddresses()
+                                .map(|b| b.to_string())
+                                .unwrap_or_default();
                             let zone_scope = if name.contains("[Allow:LAN]")
                                 || name.contains("[In:Allow:LAN]")
                                 || remote_ip.contains("LocalSubnet")
                                 || remote_ip.contains("192.168.")
                             {
                                 AllowedZoneScope::LanOnly
-                            } else if name.contains("[Allow:Internet]") || name.contains("[In:Allow:Internet]") {
+                            } else if name.contains("[Allow:Internet]")
+                                || name.contains("[In:Allow:Internet]")
+                            {
                                 AllowedZoneScope::InternetOnly
                             } else {
                                 AllowedZoneScope::Both
@@ -751,14 +770,19 @@ impl FirewallBackend for ComFirewallBackend {
                             };
 
                             let ports_str = match direction {
-                                RuleDirection::Inbound => r.LocalPorts().map(|b| b.to_string()).unwrap_or_default(),
-                                RuleDirection::Outbound => r.RemotePorts().map(|b| b.to_string()).unwrap_or_default(),
+                                RuleDirection::Inbound => {
+                                    r.LocalPorts().map(|b| b.to_string()).unwrap_or_default()
+                                }
+                                RuleDirection::Outbound => {
+                                    r.RemotePorts().map(|b| b.to_string()).unwrap_or_default()
+                                }
                             };
-                            let ports = if ports_str.is_empty() || ports_str.eq_ignore_ascii_case("any") {
-                                "*".to_string()
-                            } else {
-                                ports_str
-                            };
+                            let ports =
+                                if ports_str.is_empty() || ports_str.eq_ignore_ascii_case("any") {
+                                    "*".to_string()
+                                } else {
+                                    ports_str
+                                };
 
                             let custom_remote_ip = if !remote_ip.is_empty()
                                 && remote_ip != "*"
@@ -772,7 +796,9 @@ impl FirewallBackend for ComFirewallBackend {
 
                             let key = make_app_key(&prog, svc_opt.as_deref(), direction);
                             if let Some(existing) = map.get(&key) {
-                                if existing.action == RuleAction::Block && action == RuleAction::Allow {
+                                if existing.action == RuleAction::Block
+                                    && action == RuleAction::Allow
+                                {
                                     return;
                                 }
                             }
@@ -822,13 +848,20 @@ impl FirewallBackend for ComFirewallBackend {
                         if !is_its_fw {
                             return;
                         }
-                        let prog = r.ApplicationName().map(|b| b.to_string()).unwrap_or_default();
+                        let prog = r
+                            .ApplicationName()
+                            .map(|b| b.to_string())
+                            .unwrap_or_default();
                         let svc = r.ServiceName().map(|b| b.to_string()).unwrap_or_default();
                         let dir = match r.Direction() {
                             Ok(d) if d == NET_FW_RULE_DIR_IN => RuleDirection::Inbound,
                             _ => RuleDirection::Outbound,
                         };
-                        let svc_opt = if svc.is_empty() { None } else { Some(svc.as_str()) };
+                        let svc_opt = if svc.is_empty() {
+                            None
+                        } else {
+                            Some(svc.as_str())
+                        };
                         let key = make_app_key(&prog, svc_opt, dir);
                         map.insert(key, name.clone());
                         if dir == RuleDirection::Outbound && svc.is_empty() && !prog.is_empty() {
@@ -849,7 +882,8 @@ impl FirewallBackend for ComFirewallBackend {
         );
 
         if params.action == RuleAction::Allow
-            && (params.name.contains("[Allow:Internet]") || params.name.contains("[In:Allow:Internet]"))
+            && (params.name.contains("[Allow:Internet]")
+                || params.name.contains("[In:Allow:Internet]"))
         {
             let block_lan_params = FirewallRuleParams {
                 name: format!("{}: Block LAN", params.name),
@@ -915,7 +949,10 @@ impl FirewallBackend for ComFirewallBackend {
                         return;
                     }
                 }
-                let prog = r.ApplicationName().map(|b| b.to_string()).unwrap_or_default();
+                let prog = r
+                    .ApplicationName()
+                    .map(|b| b.to_string())
+                    .unwrap_or_default();
                 let svc = r.ServiceName().map(|b| b.to_string()).unwrap_or_default();
                 let name = r.Name().map(|b| b.to_string()).unwrap_or_default();
 
@@ -1084,7 +1121,9 @@ impl WindowsFirewallManager<SystemCommandRunner> {
         Ok(())
     }
 
-    pub fn load_rules_from_os(direction: RuleDirection) -> std::collections::HashMap<String, AppRule> {
+    pub fn load_rules_from_os(
+        direction: RuleDirection,
+    ) -> std::collections::HashMap<String, AppRule> {
         #[cfg(windows)]
         {
             if let Ok(backend) = ComFirewallBackend::new() {
@@ -1312,7 +1351,8 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
 
         // Якщо це правило Allow Internet Only: спочатку блокуємо доступ до LAN, потім дозволяємо any
         if params.action == RuleAction::Allow
-            && (params.name.contains("[Allow:Internet]") || params.name.contains("[In:Allow:Internet]"))
+            && (params.name.contains("[Allow:Internet]")
+                || params.name.contains("[In:Allow:Internet]"))
         {
             let block_lan_name = format!("{}: Block LAN", params.name);
             let _ = self.runner.execute(&[
@@ -1450,10 +1490,16 @@ mod tests {
             created_at: 0,
         };
         let svc_params = FirewallRuleParams::from_app_rule(&svc_rule);
-        assert_eq!(svc_params.name, "its.fw: svchost.exe [DiagTrack] [Block:All]");
+        assert_eq!(
+            svc_params.name,
+            "its.fw: svchost.exe [DiagTrack] [Block:All]"
+        );
         assert_eq!(svc_params.service_name, Some("DiagTrack".into()));
         assert_eq!(svc_params.remote_addresses, "20.190.159.0/24");
-        assert_eq!(svc_params.remote_ports, None, "NetProtocol::Any must clear ports");
+        assert_eq!(
+            svc_params.remote_ports, None,
+            "NetProtocol::Any must clear ports"
+        );
     }
 
     #[test]
@@ -1794,7 +1840,8 @@ Ok.
         // Delete
         assert_eq!(executed[0][2], "delete");
         // Block Internet auxiliary rule must use dir=in
-        assert!(executed[1].contains(&"name=its.fw: listener.exe [In:Allow:LAN]: Block Internet".to_string()));
+        assert!(executed[1]
+            .contains(&"name=its.fw: listener.exe [In:Allow:LAN]: Block Internet".to_string()));
         assert!(executed[1].contains(&"dir=in".to_string()));
         assert!(executed[1].contains(&"action=block".to_string()));
         // Allow rule must also use dir=in

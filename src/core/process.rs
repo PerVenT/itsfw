@@ -41,10 +41,7 @@ pub struct ProcessMetadata {
 }
 
 pub fn is_shared_service_host(exe_name: &str) -> bool {
-    let filename = exe_name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(exe_name);
+    let filename = exe_name.rsplit(['/', '\\']).next().unwrap_or(exe_name);
     matches!(
         filename.to_ascii_lowercase().as_str(),
         "svchost.exe"
@@ -170,7 +167,8 @@ pub fn get_running_services_by_pid() -> HashMap<u32, Vec<ServiceInfo>> {
     let mut map: HashMap<u32, Vec<ServiceInfo>> = HashMap::new();
 
     unsafe {
-        let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE) {
+        let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE)
+        {
             Ok(h) => h,
             Err(_) => return map,
         };
@@ -280,9 +278,7 @@ fn query_file_description(app_path: &str) -> Option<String> {
     }
 
     let mut data = vec![0u8; size as usize];
-    let ok = unsafe {
-        GetFileVersionInfoW(&wide_path, 0, size, data.as_mut_ptr() as *mut c_void)
-    };
+    let ok = unsafe { GetFileVersionInfoW(&wide_path, 0, size, data.as_mut_ptr() as *mut c_void) };
     if ok.is_err() {
         return None;
     }
@@ -298,7 +294,8 @@ fn query_file_description(app_path: &str) -> Option<String> {
             &mut trans_ptr,
             &mut trans_len,
         )
-    }.as_bool();
+    }
+    .as_bool();
 
     let mut subblocks_to_try = Vec::new();
     if has_trans && !trans_ptr.is_null() && trans_len >= 4 {
@@ -307,7 +304,10 @@ fn query_file_description(app_path: &str) -> Option<String> {
         };
         let lang = trans_slice[0];
         let codepage = trans_slice[1];
-        subblocks_to_try.push(format!("\\StringFileInfo\\{:04x}{:04x}\\FileDescription", lang, codepage));
+        subblocks_to_try.push(format!(
+            "\\StringFileInfo\\{:04x}{:04x}\\FileDescription",
+            lang, codepage
+        ));
     }
 
     // Fallbacks per Spec §3.4
@@ -325,12 +325,12 @@ fn query_file_description(app_path: &str) -> Option<String> {
                 &mut desc_ptr,
                 &mut desc_len,
             )
-        }.as_bool();
+        }
+        .as_bool();
 
         if success && !desc_ptr.is_null() && desc_len > 0 {
-            let u16_slice = unsafe {
-                std::slice::from_raw_parts(desc_ptr as *const u16, desc_len as usize)
-            };
+            let u16_slice =
+                unsafe { std::slice::from_raw_parts(desc_ptr as *const u16, desc_len as usize) };
             let text = String::from_utf16_lossy(u16_slice)
                 .trim_matches('\0')
                 .trim()
@@ -498,8 +498,14 @@ mod tests {
         assert_eq!(primary_svc, Some("Dnscache".into()));
 
         let multi_svcs = vec![
-            ServiceInfo { service_name: "wuauserv".into(), display_name: "Windows Update".into() },
-            ServiceInfo { service_name: "bits".into(), display_name: "BITS".into() },
+            ServiceInfo {
+                service_name: "wuauserv".into(),
+                display_name: "Windows Update".into(),
+            },
+            ServiceInfo {
+                service_name: "bits".into(),
+                display_name: "BITS".into(),
+            },
         ];
         let (multi_label, multi_primary) = format_app_display_name("svchost.exe", &multi_svcs);
         assert_eq!(multi_label, "svchost.exe [wuauserv +1]");
@@ -512,12 +518,21 @@ mod tests {
 
     #[test]
     fn test_suspicious_path_and_signature_badges() {
-        assert!(is_suspicious_exec_path(r"C:\Users\Admin\AppData\Local\Temp\dropper.exe"));
-        assert!(is_suspicious_exec_path(r"C:\Users\Admin\Downloads\installer.exe"));
-        assert!(!is_suspicious_exec_path(r"C:\Program Files\Git\bin\git.exe"));
+        assert!(is_suspicious_exec_path(
+            r"C:\Users\Admin\AppData\Local\Temp\dropper.exe"
+        ));
+        assert!(is_suspicious_exec_path(
+            r"C:\Users\Admin\Downloads\installer.exe"
+        ));
+        assert!(!is_suspicious_exec_path(
+            r"C:\Program Files\Git\bin\git.exe"
+        ));
         assert!(!is_suspicious_exec_path(r"C:\Windows\System32\svchost.exe"));
 
-        assert_eq!(SignatureStatus::Verified("Microsoft".into()).badge(), "✓ Signed (Verified)");
+        assert_eq!(
+            SignatureStatus::Verified("Microsoft".into()).badge(),
+            "✓ Signed (Verified)"
+        );
         assert_eq!(SignatureStatus::Unsigned.badge(), "⚠ Unsigned");
         assert_eq!(SignatureStatus::Untrusted.badge(), "✗ Untrusted Signature");
         assert_eq!(SignatureStatus::Unknown.badge(), "? Unknown");

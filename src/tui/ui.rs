@@ -453,10 +453,7 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
 
         let mut desc_sign_spans = vec![
             Span::styled("Desc: ", Style::default().fg(palette.fg_muted)),
-            Span::styled(
-                fit_width(desc_display, 24),
-                Style::default().fg(palette.fg),
-            ),
+            Span::styled(fit_width(desc_display, 24), Style::default().fg(palette.fg)),
             Span::styled("  Sign: ", Style::default().fg(palette.fg_muted)),
             Span::styled(
                 sign_badge,
@@ -616,10 +613,7 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("[{}] ", act_tag),
                     Style::default().fg(act_color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("{} ", endpoint),
-                    Style::default().fg(palette.fg),
-                ),
+                Span::styled(format!("{} ", endpoint), Style::default().fg(palette.fg)),
                 Span::styled(
                     format!("[{}]", zone_tag),
                     Style::default().fg(match event.zone {
@@ -1195,16 +1189,12 @@ fn render_edit_modal(f: &mut Frame, app: &App) {
         Span::raw(" "),
         Span::styled(
             "[All (LAN+Inet)]",
-            opt_style(
-                !app.edit_custom_ip_mode && app.edit_zone_scope == AllowedZoneScope::Both,
-            ),
+            opt_style(!app.edit_custom_ip_mode && app.edit_zone_scope == AllowedZoneScope::Both),
         ),
         Span::raw(" "),
         Span::styled(
             "[LAN Only]",
-            opt_style(
-                !app.edit_custom_ip_mode && app.edit_zone_scope == AllowedZoneScope::LanOnly,
-            ),
+            opt_style(!app.edit_custom_ip_mode && app.edit_zone_scope == AllowedZoneScope::LanOnly),
         ),
         Span::raw(" "),
         Span::styled(

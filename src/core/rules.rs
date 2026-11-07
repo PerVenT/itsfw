@@ -59,7 +59,11 @@ impl AppRule {
     }
 }
 
-pub fn make_app_key(app_path: &str, service_name: Option<&str>, direction: RuleDirection) -> String {
+pub fn make_app_key(
+    app_path: &str,
+    service_name: Option<&str>,
+    direction: RuleDirection,
+) -> String {
     let lower_path = app_path.to_lowercase();
     let base_key = match service_name {
         Some(svc) if !svc.trim().is_empty() => {
@@ -310,11 +314,19 @@ mod tests {
     #[test]
     fn test_make_app_key_and_validators() {
         assert_eq!(
-            make_app_key(r"C:\Windows\System32\svchost.exe", None, RuleDirection::Outbound),
+            make_app_key(
+                r"C:\Windows\System32\svchost.exe",
+                None,
+                RuleDirection::Outbound
+            ),
             r"c:\windows\system32\svchost.exe"
         );
         assert_eq!(
-            make_app_key(r"C:\Windows\System32\svchost.exe", Some("Dnscache"), RuleDirection::Outbound),
+            make_app_key(
+                r"C:\Windows\System32\svchost.exe",
+                Some("Dnscache"),
+                RuleDirection::Outbound
+            ),
             r"c:\windows\system32\svchost.exe::svc:dnscache"
         );
         assert_eq!(
@@ -322,13 +334,19 @@ mod tests {
             r"in::c:\app\server.exe"
         );
 
-        assert_eq!(validate_ports_spec("80, 443, 8000-8080", NetProtocol::Tcp).unwrap(), "80,443,8000-8080");
+        assert_eq!(
+            validate_ports_spec("80, 443, 8000-8080", NetProtocol::Tcp).unwrap(),
+            "80,443,8000-8080"
+        );
         assert_eq!(validate_ports_spec("443", NetProtocol::Any).unwrap(), "*");
         assert!(validate_ports_spec("0", NetProtocol::Tcp).is_err());
         assert!(validate_ports_spec("9000-8000", NetProtocol::Tcp).is_err());
         assert!(validate_ports_spec("70000", NetProtocol::Udp).is_err());
 
-        assert_eq!(validate_ip_or_cidr_spec("192.168.1.1, 10.0.0.0/8").unwrap(), "192.168.1.1,10.0.0.0/8");
+        assert_eq!(
+            validate_ip_or_cidr_spec("192.168.1.1, 10.0.0.0/8").unwrap(),
+            "192.168.1.1,10.0.0.0/8"
+        );
         assert!(validate_ip_or_cidr_spec("999.999.1.1").is_err());
         assert!(validate_ip_or_cidr_spec("10.0.0.1/33").is_err());
     }

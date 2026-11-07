@@ -367,13 +367,11 @@ impl App {
             FirewallDirection::Inbound => RuleDirection::Inbound,
         };
         let app_key = crate::core::rules::make_app_key(app_path, None, dir);
-        self.active_rules
-            .get(&app_key)
-            .or_else(|| {
-                self.active_rules
-                    .get(&app_path.to_lowercase())
-                    .filter(|r| r.service_name.is_none())
-            })
+        self.active_rules.get(&app_key).or_else(|| {
+            self.active_rules
+                .get(&app_path.to_lowercase())
+                .filter(|r| r.service_name.is_none())
+        })
     }
 
     /// Визначає назву служби для заданого шляху: спершу перевіряє поточний виділений елемент,
@@ -752,11 +750,7 @@ impl App {
             .iter()
             .position(|f| *f == self.edit_focused_field)
             .unwrap_or(0);
-        let prev_pos = if pos == 0 {
-            fields.len() - 1
-        } else {
-            pos - 1
-        };
+        let prev_pos = if pos == 0 { fields.len() - 1 } else { pos - 1 };
         self.edit_focused_field = fields[prev_pos];
     }
 
@@ -888,14 +882,14 @@ impl App {
         };
 
         // Validate ports
-        let validated_ports =
-            match crate::core::rules::validate_ports_spec(&self.edit_ports, proto) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.edit_error = Some(e);
-                    return false;
-                }
-            };
+        let validated_ports = match crate::core::rules::validate_ports_spec(&self.edit_ports, proto)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                self.edit_error = Some(e);
+                return false;
+            }
+        };
 
         // Validate custom IP if applicable
         let custom_remote_ip = if self.edit_custom_ip_mode {
@@ -1332,7 +1326,9 @@ impl App {
                 if rule.service_name.is_none() {
                     self.aggregator.blocked_paths_or_names.insert(key.clone());
                 }
-                self.aggregator.blocked_paths_or_names.insert(app_key.clone());
+                self.aggregator
+                    .blocked_paths_or_names
+                    .insert(app_key.clone());
                 if !filename.is_empty() && rule.service_name.is_none() {
                     self.aggregator.blocked_paths_or_names.insert(filename);
                 }
@@ -1835,7 +1831,9 @@ mod tests {
         app.edit_ports = "443,8080-8090".into();
         assert!(app.save_prefilled_rule());
         assert!(!app.edit_mode);
-        let saved = app.rule_for_app(r"C:\App\curl.exe").expect("rule must be saved");
+        let saved = app
+            .rule_for_app(r"C:\App\curl.exe")
+            .expect("rule must be saved");
         assert_eq!(saved.action, RuleAction::Block);
         assert_eq!(saved.ports, "443,8080-8090");
     }

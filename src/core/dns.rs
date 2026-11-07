@@ -162,8 +162,8 @@ fn rdns_worker_loop(
 #[cfg(windows)]
 fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
     use windows::Win32::Networking::WinSock::{
-        GetNameInfoW, AF_INET, AF_INET6, IN6_ADDR, IN_ADDR, NI_NAMEREQD, SOCKADDR, SOCKADDR_IN,
-        SOCKADDR_IN6, socklen_t,
+        socklen_t, GetNameInfoW, AF_INET, AF_INET6, IN6_ADDR, IN_ADDR, NI_NAMEREQD, SOCKADDR,
+        SOCKADDR_IN, SOCKADDR_IN6,
     };
 
     let mut host_buf = [0u16; 1024];
@@ -193,9 +193,7 @@ fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
             let mut sin6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
             sin6.sin6_family = AF_INET6;
             sin6.sin6_addr = IN6_ADDR {
-                u: windows::Win32::Networking::WinSock::IN6_ADDR_0 {
-                    Byte: v6.octets(),
-                },
+                u: windows::Win32::Networking::WinSock::IN6_ADDR_0 { Byte: v6.octets() },
             };
             let ptr = &sin6 as *const SOCKADDR_IN6 as *const SOCKADDR;
             let len = std::mem::size_of::<SOCKADDR_IN6>() as i32;
@@ -212,7 +210,10 @@ fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
     };
 
     if ret == 0 {
-        let len = host_buf.iter().position(|&c| c == 0).unwrap_or(host_buf.len());
+        let len = host_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(host_buf.len());
         if len > 0 {
             let s = String::from_utf16_lossy(&host_buf[..len]);
             let trimmed = s.trim().trim_end_matches('.');
@@ -257,15 +258,18 @@ Windows IP Configuration
 "#;
         let map = parse_ipconfig_displaydns(sample);
         assert_eq!(
-            map.get(&IpAddr::from_str("140.82.121.6").unwrap()).map(|s| s.as_str()),
+            map.get(&IpAddr::from_str("140.82.121.6").unwrap())
+                .map(|s| s.as_str()),
             Some("api.github.com")
         );
         assert_eq!(
-            map.get(&IpAddr::from_str("20.190.159.4").unwrap()).map(|s| s.as_str()),
+            map.get(&IpAddr::from_str("20.190.159.4").unwrap())
+                .map(|s| s.as_str()),
             Some("v10.events.data.microsoft.com")
         );
         assert_eq!(
-            map.get(&IpAddr::from_str("2a00:1450:4001:828::200e").unwrap()).map(|s| s.as_str()),
+            map.get(&IpAddr::from_str("2a00:1450:4001:828::200e").unwrap())
+                .map(|s| s.as_str()),
             Some("ipv6.google.com")
         );
     }
@@ -331,7 +335,10 @@ Windows IP Configuration
 
         // Simulating worker thread updating cache
         resolver.insert_for_test(public_ip, "dns.google".into());
-        assert_eq!(resolver.resolve_or_enqueue(public_ip), Some("dns.google".into()));
+        assert_eq!(
+            resolver.resolve_or_enqueue(public_ip),
+            Some("dns.google".into())
+        );
     }
 
     #[test]
@@ -339,7 +346,12 @@ Windows IP Configuration
         let resolver = DnsResolver::new_empty();
         // Fill up the 256-capacity channel
         for i in 0..256 {
-            let dummy_ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8));
+            let dummy_ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                10,
+                0,
+                (i / 256) as u8,
+                (i % 256) as u8,
+            ));
             assert_eq!(resolver.resolve_or_enqueue(dummy_ip), None);
             assert!(resolver.cache.read().unwrap().contains_key(&dummy_ip));
         }
@@ -363,11 +375,13 @@ Windows IP Configuration
 "#;
         let map = parse_ipconfig_displaydns(multi);
         assert_eq!(
-            map.get(&IpAddr::from_str("1.1.1.1").unwrap()).map(|s| s.as_str()),
+            map.get(&IpAddr::from_str("1.1.1.1").unwrap())
+                .map(|s| s.as_str()),
             Some("multi.example.com")
         );
         assert_eq!(
-            map.get(&IpAddr::from_str("1.0.0.1").unwrap()).map(|s| s.as_str()),
+            map.get(&IpAddr::from_str("1.0.0.1").unwrap())
+                .map(|s| s.as_str()),
             Some("multi.example.com")
         );
     }
