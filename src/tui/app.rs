@@ -1258,13 +1258,23 @@ impl App {
         &mut self,
         app_path: &str,
     ) -> crate::core::process::ProcessMetadata {
-        if let Some(meta) = self.metadata_cache.get(app_path) {
-            return meta.clone();
+        self.get_or_load_metadata_with_pid(app_path, 0)
+    }
+
+    pub fn get_or_load_metadata_with_pid(
+        &mut self,
+        app_path: &str,
+        pid: u32,
+    ) -> crate::core::process::ProcessMetadata {
+        let key = app_path.to_lowercase();
+        let entry = self
+            .metadata_cache
+            .entry(key)
+            .or_insert_with(|| crate::core::process::query_process_metadata(app_path));
+        if entry.command_line.is_none() && pid > 0 {
+            entry.command_line = crate::core::process::query_process_command_line(pid);
         }
-        let meta = crate::core::process::query_process_metadata(app_path);
-        self.metadata_cache
-            .insert(app_path.to_string(), meta.clone());
-        meta
+        entry.clone()
     }
 
     pub fn set_watcher(&mut self, watcher: crate::core::watcher::FirewallRegistryWatcher) {

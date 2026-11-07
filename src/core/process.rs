@@ -37,6 +37,7 @@ impl SignatureStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessMetadata {
     pub description: Option<String>,
+    pub command_line: Option<String>,
     pub signature: SignatureStatus,
     pub is_suspicious_path: bool,
 }
@@ -239,6 +240,7 @@ pub fn query_process_metadata(app_path: &str) -> ProcessMetadata {
     if !std::path::Path::new(app_path).is_file() {
         return ProcessMetadata {
             description: None,
+            command_line: None,
             signature: SignatureStatus::Unknown,
             is_suspicious_path,
         };
@@ -249,6 +251,7 @@ pub fn query_process_metadata(app_path: &str) -> ProcessMetadata {
 
     ProcessMetadata {
         description,
+        command_line: None,
         signature,
         is_suspicious_path,
     }
@@ -258,9 +261,90 @@ pub fn query_process_metadata(app_path: &str) -> ProcessMetadata {
 pub fn query_process_metadata(app_path: &str) -> ProcessMetadata {
     ProcessMetadata {
         description: None,
+        command_line: None,
         signature: SignatureStatus::Unknown,
         is_suspicious_path: is_suspicious_exec_path(app_path),
     }
+}
+
+pub fn decode_unicode_string_buffer(buf: &[u8], base_addr: usize) -> Option<String> {
+    if buf.len() < 16 {
+        return None;
+    }
+    let len_bytes = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    if len_bytes == 0 || !len_bytes.is_multiple_of(2) {
+        return None;
+    }
+    let ptr_val = u64::from_le_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]) as usize;
+    let offset = ptr_val.checked_sub(base_addr)?;
+    let end = offset.checked_add(len_bytes)?;
+    if end > buf.len() {
+        return None;
+    }
+    let u16_len = len_bytes / 2;
+    let mut utf16 = Vec::with_capacity(u16_len);
+    for i in 0..u16_len {
+        let pos = offset + i * 2;
+        utf16.push(u16::from_le_bytes([buf[pos], buf[pos + 1]]));
+    }
+    let text = String::from_utf16_lossy(&utf16)
+        .trim_matches('\0')
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[cfg(windows)]
+pub fn query_process_command_line(pid: u32) -> Option<String> {
+    if pid == 0 || cfg!(test) {
+        return None;
+    }
+    use std::ffi::c_void;
+    use windows::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut return_len: u32 = 0;
+        let _ = NtQueryInformationProcess(
+            handle,
+            ProcessCommandLineInformation,
+            std::ptr::null_mut(),
+            0,
+            &mut return_len,
+        );
+        if return_len <= 16 || return_len > 65536 {
+            let _ = CloseHandle(handle);
+            return None;
+        }
+        let mut buf = vec![0u8; return_len as usize];
+        let status = NtQueryInformationProcess(
+            handle,
+            ProcessCommandLineInformation,
+            buf.as_mut_ptr() as *mut c_void,
+            return_len,
+            &mut return_len,
+        );
+        let _ = CloseHandle(handle);
+        if status.is_err() {
+            return None;
+        }
+        decode_unicode_string_buffer(&buf, buf.as_ptr() as usize)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn query_process_command_line(_pid: u32) -> Option<String> {
+    None
 }
 
 #[cfg(windows)]
@@ -737,5 +821,40 @@ mod tests {
         if cfg!(not(windows)) {
             assert!(services_by_pid.is_empty());
         }
+    }
+
+    #[test]
+    fn test_decode_unicode_string_buffer_and_command_line_fallback() {
+        // 1. Too short buffer -> None
+        assert_eq!(decode_unicode_string_buffer(&[0u8; 4], 0x1000), None);
+
+        // 2. Construct a valid 64-bit UNICODE_STRING layout:
+        // Length: u16 (offset 0), MaximumLength: u16 (offset 2), padding: u32 (offset 4), Buffer: usize (offset 8)
+        let cmd_utf16: Vec<u16> = "python.exe -m http.server 8000".encode_utf16().collect();
+        let byte_len = (cmd_utf16.len() * 2) as u16;
+        let header_size = 16usize;
+        let base_addr = 0x20000usize;
+        let mut buf = vec![0u8; header_size + byte_len as usize];
+        buf[0..2].copy_from_slice(&byte_len.to_le_bytes());
+        buf[2..4].copy_from_slice(&byte_len.to_le_bytes());
+        let ptr_val = base_addr + header_size;
+        buf[8..16].copy_from_slice(&(ptr_val as u64).to_le_bytes());
+        for (i, ch) in cmd_utf16.iter().enumerate() {
+            let off = header_size + i * 2;
+            buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+
+        assert_eq!(
+            decode_unicode_string_buffer(&buf, base_addr),
+            Some("python.exe -m http.server 8000".into())
+        );
+
+        // 3. Out-of-bounds pointer -> None
+        let mut bad_buf = buf.clone();
+        bad_buf[8..16].copy_from_slice(&(base_addr as u64 + 99999).to_le_bytes());
+        assert_eq!(decode_unicode_string_buffer(&bad_buf, base_addr), None);
+
+        // 4. query_process_command_line(0) -> None
+        assert_eq!(query_process_command_line(0), None);
     }
 }
