@@ -60,7 +60,8 @@ impl Default for DnsResolver {
 
 impl DnsResolver {
     pub fn new_empty() -> Self {
-        let (req_tx, _req_rx) = crossbeam_channel::bounded(256);
+        let (req_tx, req_rx) = crossbeam_channel::bounded(256);
+        std::mem::forget(req_rx);
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             req_tx,
@@ -82,10 +83,11 @@ impl DnsResolver {
             if let Some(entry) = cache.get(&ip) {
                 return entry.clone();
             }
-            cache.insert(ip, None);
+            if self.req_tx.try_send(ip).is_ok() {
+                cache.insert(ip, None);
+            }
         }
 
-        let _ = self.req_tx.try_send(ip);
         None
     }
 
@@ -166,7 +168,7 @@ fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
 
     let mut host_buf = [0u16; 1024];
 
-    let (sockaddr_storage, sockaddr_len) = match ip {
+    let ret = match ip {
         IpAddr::V4(v4) => {
             let mut sin: SOCKADDR_IN = unsafe { std::mem::zeroed() };
             sin.sin_family = AF_INET;
@@ -176,7 +178,16 @@ fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
                 },
             };
             let ptr = &sin as *const SOCKADDR_IN as *const SOCKADDR;
-            (ptr, std::mem::size_of::<SOCKADDR_IN>() as i32)
+            let len = std::mem::size_of::<SOCKADDR_IN>() as i32;
+            unsafe {
+                GetNameInfoW(
+                    ptr,
+                    socklen_t(len),
+                    Some(&mut host_buf),
+                    None,
+                    NI_NAMEREQD as i32,
+                )
+            }
         }
         IpAddr::V6(v6) => {
             let mut sin6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
@@ -187,18 +198,17 @@ fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
                 },
             };
             let ptr = &sin6 as *const SOCKADDR_IN6 as *const SOCKADDR;
-            (ptr, std::mem::size_of::<SOCKADDR_IN6>() as i32)
+            let len = std::mem::size_of::<SOCKADDR_IN6>() as i32;
+            unsafe {
+                GetNameInfoW(
+                    ptr,
+                    socklen_t(len),
+                    Some(&mut host_buf),
+                    None,
+                    NI_NAMEREQD as i32,
+                )
+            }
         }
-    };
-
-    let ret = unsafe {
-        GetNameInfoW(
-            sockaddr_storage,
-            socklen_t(sockaddr_len),
-            Some(&mut host_buf),
-            None,
-            NI_NAMEREQD as i32,
-        )
     };
 
     if ret == 0 {
@@ -322,6 +332,22 @@ Windows IP Configuration
         // Simulating worker thread updating cache
         resolver.insert_for_test(public_ip, "dns.google".into());
         assert_eq!(resolver.resolve_or_enqueue(public_ip), Some("dns.google".into()));
+    }
+
+    #[test]
+    fn test_resolver_queue_full_does_not_poison_cache() {
+        let resolver = DnsResolver::new_empty();
+        // Fill up the 256-capacity channel
+        for i in 0..256 {
+            let dummy_ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8));
+            assert_eq!(resolver.resolve_or_enqueue(dummy_ip), None);
+            assert!(resolver.cache.read().unwrap().contains_key(&dummy_ip));
+        }
+
+        // Channel is now full. Next IP should fail to send and NOT be inserted into cache
+        let overflow_ip = IpAddr::from_str("198.51.100.1").unwrap();
+        assert_eq!(resolver.resolve_or_enqueue(overflow_ip), None);
+        assert!(!resolver.cache.read().unwrap().contains_key(&overflow_ip));
     }
 
     #[test]
