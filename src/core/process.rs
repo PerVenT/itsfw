@@ -351,8 +351,9 @@ fn verify_authenticode_signature(app_path: &str) -> SignatureStatus {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Security::WinTrust::{
         WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
-        WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
-        WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+        WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE,
+        WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
+        WTD_UI_NONE,
     };
 
     let wide_path = HSTRING::from(app_path);
@@ -376,7 +377,7 @@ fn verify_authenticode_signature(app_path: &str) -> SignatureStatus {
         dwStateAction: WTD_STATEACTION_VERIFY,
         hWVTStateData: Default::default(),
         pwszURLReference: PWSTR::null(),
-        dwProvFlags: Default::default(),
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE,
         dwUIContext: Default::default(),
         pSignatureSettings: std::ptr::null_mut(),
     };
