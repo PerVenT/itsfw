@@ -25,6 +25,7 @@ pub enum SignatureStatus {
 impl SignatureStatus {
     pub fn badge(&self) -> &'static str {
         match self {
+            SignatureStatus::Verified(kind) if kind == "Catalog" => "✓ Signed (Catalog)",
             SignatureStatus::Verified(_) => "✓ Signed (Verified)",
             SignatureStatus::Unsigned => "⚠ Unsigned",
             SignatureStatus::Untrusted => "✗ Untrusted Signature",
@@ -406,9 +407,189 @@ fn verify_authenticode_signature(app_path: &str) -> SignatureStatus {
     if res == 0 {
         SignatureStatus::Verified("Authenticode".into())
     } else if res == TRUST_E_NOSIGNATURE {
-        SignatureStatus::Unsigned
+        verify_catalog_signature(app_path, &wide_path)
     } else {
         SignatureStatus::Untrusted
+    }
+}
+
+#[cfg(windows)]
+fn verify_catalog_signature(app_path: &str, wide_path: &windows::core::HSTRING) -> SignatureStatus {
+    use std::os::windows::io::AsRawHandle;
+    use windows::core::w;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Cryptography::Catalog::{
+        CryptCATAdminAcquireContext, CryptCATAdminAcquireContext2,
+        CryptCATAdminCalcHashFromFileHandle2, CryptCATAdminEnumCatalogFromHash,
+        CryptCATAdminReleaseCatalogContext, CryptCATAdminReleaseContext,
+        CryptCATCatalogInfoFromContext, CATALOG_INFO,
+    };
+
+    let file = match std::fs::File::open(app_path) {
+        Ok(f) => f,
+        Err(_) => return SignatureStatus::Unsigned,
+    };
+    let h_file = HANDLE(file.as_raw_handle());
+
+    // Перевіряємо спочатку SHA256-каталоги (Windows 10/11), потім SHA1 (legacy системні каталоги)
+    for use_sha256 in [true, false] {
+        let mut h_cat_admin: isize = 0;
+        let acquired = unsafe {
+            if use_sha256 {
+                CryptCATAdminAcquireContext2(&mut h_cat_admin, None, w!("SHA256"), None, 0).is_ok()
+            } else {
+                CryptCATAdminAcquireContext(&mut h_cat_admin, None, 0).is_ok()
+            }
+        };
+        if !acquired || h_cat_admin == 0 {
+            continue;
+        }
+
+        let mut hash_len: u32 = 0;
+        let _ = unsafe {
+            CryptCATAdminCalcHashFromFileHandle2(h_cat_admin, h_file, &mut hash_len, None, 0)
+        };
+        if hash_len == 0 {
+            unsafe {
+                let _ = CryptCATAdminReleaseContext(h_cat_admin, 0);
+            }
+            continue;
+        }
+
+        let mut hash_buf = vec![0u8; hash_len as usize];
+        let hash_ok = unsafe {
+            CryptCATAdminCalcHashFromFileHandle2(
+                h_cat_admin,
+                h_file,
+                &mut hash_len,
+                Some(hash_buf.as_mut_ptr()),
+                0,
+            )
+            .is_ok()
+        };
+        if !hash_ok {
+            unsafe {
+                let _ = CryptCATAdminReleaseContext(h_cat_admin, 0);
+            }
+            continue;
+        }
+        hash_buf.truncate(hash_len as usize);
+
+        let h_cat_info =
+            unsafe { CryptCATAdminEnumCatalogFromHash(h_cat_admin, &hash_buf, 0, None) };
+        if h_cat_info == 0 {
+            unsafe {
+                let _ = CryptCATAdminReleaseContext(h_cat_admin, 0);
+            }
+            continue;
+        }
+
+        let mut cat_info = CATALOG_INFO {
+            cbStruct: std::mem::size_of::<CATALOG_INFO>() as u32,
+            ..Default::default()
+        };
+        let info_ok =
+            unsafe { CryptCATCatalogInfoFromContext(h_cat_info, &mut cat_info, 0).is_ok() };
+
+        let status = if info_ok {
+            verify_catalog_member_trust(
+                h_cat_admin,
+                &cat_info.wszCatalogFile,
+                wide_path,
+                h_file,
+                &mut hash_buf,
+            )
+        } else {
+            None
+        };
+
+        unsafe {
+            let _ = CryptCATAdminReleaseCatalogContext(h_cat_admin, h_cat_info, 0);
+            let _ = CryptCATAdminReleaseContext(h_cat_admin, 0);
+        }
+
+        if let Some(verified_status) = status {
+            return verified_status;
+        }
+    }
+
+    SignatureStatus::Unsigned
+}
+
+#[cfg(windows)]
+fn verify_catalog_member_trust(
+    h_cat_admin: isize,
+    catalog_file: &[u16; 260],
+    wide_member_path: &windows::core::HSTRING,
+    h_member_file: windows::Win32::Foundation::HANDLE,
+    hash_buf: &mut [u8],
+) -> Option<SignatureStatus> {
+    use std::ffi::c_void;
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Security::WinTrust::{
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_CATALOG_INFO, WINTRUST_DATA,
+        WINTRUST_DATA_0, WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_CATALOG,
+        WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
+        WTD_UI_NONE,
+    };
+
+    let hex_tag: String = hash_buf.iter().map(|b| format!("{:02X}", b)).collect();
+    let wide_tag = HSTRING::from(hex_tag);
+
+    let mut wt_cat_info = WINTRUST_CATALOG_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32,
+        dwCatalogVersion: 0,
+        pcwszCatalogFilePath: PCWSTR(catalog_file.as_ptr()),
+        pcwszMemberTag: PCWSTR(wide_tag.as_ptr()),
+        pcwszMemberFilePath: PCWSTR(wide_member_path.as_ptr()),
+        hMemberFile: h_member_file,
+        pbCalculatedFileHash: hash_buf.as_mut_ptr(),
+        cbCalculatedFileHash: hash_buf.len() as u32,
+        pcCatalogContext: std::ptr::null_mut(),
+        hCatAdmin: h_cat_admin,
+    };
+
+    let mut trust_data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        pPolicyCallbackData: std::ptr::null_mut(),
+        pSIPClientData: std::ptr::null_mut(),
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_CATALOG,
+        Anonymous: WINTRUST_DATA_0 {
+            pCatalog: &mut wt_cat_info,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        hWVTStateData: Default::default(),
+        pwszURLReference: PWSTR::null(),
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE,
+        dwUIContext: Default::default(),
+        pSignatureSettings: std::ptr::null_mut(),
+    };
+
+    let mut action_guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let res = unsafe {
+        WinVerifyTrust(
+            HWND(std::ptr::null_mut()),
+            &mut action_guid,
+            &mut trust_data as *mut _ as *mut c_void,
+        )
+    };
+
+    trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe {
+        let _ = WinVerifyTrust(
+            HWND(std::ptr::null_mut()),
+            &mut action_guid,
+            &mut trust_data as *mut _ as *mut c_void,
+        );
+    }
+
+    if res == 0 {
+        Some(SignatureStatus::Verified("Catalog".into()))
+    } else {
+        Some(SignatureStatus::Untrusted)
     }
 }
 
@@ -533,6 +714,10 @@ mod tests {
         assert_eq!(
             SignatureStatus::Verified("Microsoft".into()).badge(),
             "✓ Signed (Verified)"
+        );
+        assert_eq!(
+            SignatureStatus::Verified("Catalog".into()).badge(),
+            "✓ Signed (Catalog)"
         );
         assert_eq!(SignatureStatus::Unsigned.badge(), "⚠ Unsigned");
         assert_eq!(SignatureStatus::Untrusted.badge(), "✗ Untrusted Signature");
