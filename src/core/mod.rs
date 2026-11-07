@@ -5,4 +5,5 @@ pub mod monitor;
 pub mod process;
 pub mod rules;
 pub mod scanner;
+pub mod watcher;
 pub mod zone;
