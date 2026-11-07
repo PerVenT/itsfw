@@ -34,6 +34,9 @@ pub struct AppActivitySummary {
     pub last_target_zone: Zone,
     pub last_target_port: u16,
     pub last_protocol: String,
+    pub total_rx_bytes: u64,
+    pub total_tx_bytes: u64,
+    pub current_speed_bytes_per_sec: u64,
     pub seen_zones: BTreeSet<Zone>,
     pub seen_ports: BTreeSet<u16>,
     pub seen_protocols: BTreeSet<String>,
@@ -103,6 +106,42 @@ impl AppActivitySummary {
                 .join("/")
         }
     }
+
+    /// Відображає поточну швидкість передачі або сумарний накопичений обсяг за сесію.
+    pub fn traffic_transfer_display(&self) -> String {
+        let total = self.total_rx_bytes.saturating_add(self.total_tx_bytes);
+        if self.current_speed_bytes_per_sec > 0 {
+            format_speed(self.current_speed_bytes_per_sec)
+        } else if total > 0 {
+            format_bytes(total)
+        } else {
+            "-".to_string()
+        }
+    }
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if bytes >= GB as u64 {
+        format!("{:.1} GB", b / GB)
+    } else if bytes >= MB as u64 {
+        format!("{:.1} MB", b / MB)
+    } else if bytes >= KB as u64 {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+pub fn format_speed(bytes_per_sec: u64) -> String {
+    if bytes_per_sec == 0 {
+        "0 B/s".to_string()
+    } else {
+        format!("{}/s", format_bytes(bytes_per_sec))
+    }
 }
 
 #[derive(Default)]
@@ -167,6 +206,9 @@ impl EventAggregator {
                         crate::core::rules::NetProtocol::Udp => "UDP".into(),
                         crate::core::rules::NetProtocol::Any => "ANY".into(),
                     },
+                    total_rx_bytes: 0,
+                    total_tx_bytes: 0,
+                    current_speed_bytes_per_sec: 0,
                     seen_zones: BTreeSet::new(),
                     seen_ports: BTreeSet::new(),
                     seen_protocols: BTreeSet::new(),
@@ -219,6 +261,9 @@ impl EventAggregator {
                         last_target_zone: Zone::Internet,
                         last_target_port: 0,
                         last_protocol: "ANY".into(),
+                        total_rx_bytes: 0,
+                        total_tx_bytes: 0,
+                        current_speed_bytes_per_sec: 0,
                         seen_zones: BTreeSet::new(),
                         seen_ports: BTreeSet::new(),
                         seen_protocols: BTreeSet::new(),
@@ -270,6 +315,9 @@ impl EventAggregator {
             last_target_zone: event.zone,
             last_target_port: event.remote_port,
             last_protocol: event.protocol.clone(),
+            total_rx_bytes: 0,
+            total_tx_bytes: 0,
+            current_speed_bytes_per_sec: 0,
             seen_zones: BTreeSet::new(),
             seen_ports: BTreeSet::new(),
             seen_protocols: BTreeSet::new(),
@@ -316,6 +364,28 @@ impl EventAggregator {
                 .then_with(|| a.service_name.cmp(&b.service_name))
         });
         list
+    }
+
+    pub fn apply_bandwidth_deltas(
+        &mut self,
+        pid_deltas: &std::collections::HashMap<u32, (u64, u64)>,
+        elapsed_secs: f64,
+    ) {
+        let window = elapsed_secs.max(0.5);
+        for summary in self.apps.values_mut() {
+            if summary.process_id > 0 {
+                if let Some(&(rx, tx)) = pid_deltas.get(&summary.process_id) {
+                    summary.total_rx_bytes = summary.total_rx_bytes.saturating_add(rx);
+                    summary.total_tx_bytes = summary.total_tx_bytes.saturating_add(tx);
+                    let delta_total = rx.saturating_add(tx);
+                    summary.current_speed_bytes_per_sec = (delta_total as f64 / window) as u64;
+                } else {
+                    summary.current_speed_bytes_per_sec = 0;
+                }
+            } else {
+                summary.current_speed_bytes_per_sec = 0;
+            }
+        }
     }
 }
 
@@ -600,6 +670,9 @@ mod tests {
             last_target_zone: Zone::Lan,
             last_target_port: 0,
             last_protocol: "TCP".into(),
+            total_rx_bytes: 0,
+            total_tx_bytes: 0,
+            current_speed_bytes_per_sec: 0,
             seen_zones: BTreeSet::new(),
             seen_ports: BTreeSet::new(),
             seen_protocols: BTreeSet::new(),
@@ -760,5 +833,60 @@ mod tests {
         assert!(agg.apps.contains_key(&in_key));
         assert!(!agg.apps.get(&out_key).unwrap().is_knocking);
         assert!(agg.apps.get(&in_key).unwrap().is_knocking);
+    }
+
+    #[test]
+    fn test_bandwidth_deltas_and_formatting() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1048576), "1.0 MB");
+        assert_eq!(format_bytes(1073741824), "1.0 GB");
+
+        assert_eq!(format_speed(0), "0 B/s");
+        assert_eq!(format_speed(1536), "1.5 KB/s");
+
+        let summary = AppActivitySummary {
+            app_path: r"C:\app.exe".into(),
+            app_name: "app.exe".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
+            process_id: 100,
+            parent_process_name: None,
+            total_hits: 1,
+            last_hit_time: 1000,
+            is_knocking: false,
+            last_target_zone: Zone::Internet,
+            last_target_port: 443,
+            last_protocol: "TCP".into(),
+            total_rx_bytes: 0,
+            total_tx_bytes: 0,
+            current_speed_bytes_per_sec: 0,
+            seen_zones: BTreeSet::new(),
+            seen_ports: BTreeSet::new(),
+            seen_protocols: BTreeSet::new(),
+            recent_events: Vec::new(),
+        };
+
+        assert_eq!(summary.traffic_transfer_display(), "-");
+
+        let mut aggregator = EventAggregator::new();
+        aggregator.apps.insert("app".into(), summary);
+
+        let mut deltas = std::collections::HashMap::new();
+        deltas.insert(100, (1024, 2048));
+        aggregator.apply_bandwidth_deltas(&deltas, 1.0);
+
+        let s = aggregator.apps.get("app").unwrap();
+        assert_eq!(s.total_rx_bytes, 1024);
+        assert_eq!(s.total_tx_bytes, 2048);
+        assert_eq!(s.current_speed_bytes_per_sec, 3072);
+        assert_eq!(s.traffic_transfer_display(), "3.0 KB/s");
+
+        // Next tick with no deltas: speed decays to 0, display falls back to cumulative total
+        aggregator.apply_bandwidth_deltas(&std::collections::HashMap::new(), 1.0);
+        let s2 = aggregator.apps.get("app").unwrap();
+        assert_eq!(s2.current_speed_bytes_per_sec, 0);
+        assert_eq!(s2.traffic_transfer_display(), "3.0 KB");
     }
 }

@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod dns;
+pub mod etw;
 pub mod firewall;
 pub mod interfaces;
 pub mod monitor;
