@@ -71,9 +71,8 @@ impl FirewallRuleParams {
             }
         };
 
-        let (local_ports, remote_ports) = if rule.protocol == NetProtocol::Any {
-            (None, None)
-        } else if rule.ports.trim().is_empty()
+        let (local_ports, remote_ports) = if rule.protocol == NetProtocol::Any
+            || rule.ports.trim().is_empty()
             || rule.ports.trim() == "*"
             || rule.ports.trim().eq_ignore_ascii_case("any")
         {

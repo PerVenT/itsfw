@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::core::zone::Zone;
-use crate::tui::app::{App, SortMode, ViewFilter};
+use crate::tui::app::{App, RuleEditorField, SortMode, ViewFilter};
 
 /// Допоміжна функція для строгого обрізання або доповнення рядка пробілами до заданої ширини.
 fn fit_width(s: &str, width: usize) -> String {
@@ -28,13 +28,13 @@ fn fit_width(s: &str, width: usize) -> String {
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
-    // Головний вертикальний лейаут (v4): Шапка (1) -> Таблиця (100% Min) -> Нижній спліт (7) -> Футер (1)
+    // Головний вертикальний лейаут (v5): Шапка (1) -> Таблиця (100% Min) -> Нижній спліт (8) -> Футер (1)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(6),
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Length(1),
         ])
         .split(f.area());
@@ -98,6 +98,28 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     title_spans.push(Span::styled(" │ ", Style::default().fg(palette.border)));
     title_spans.push(fw_status);
 
+    if app.lockdown_active {
+        title_spans.push(Span::styled(" │ ", Style::default().fg(palette.border)));
+        title_spans.push(Span::styled(
+            "[🚨 LOCKDOWN ACTIVE]",
+            Style::default()
+                .bg(palette.alert_red)
+                .fg(palette.fg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if app.stream_paused {
+        title_spans.push(Span::styled(" │ ", Style::default().fg(palette.border)));
+        title_spans.push(Span::styled(
+            "[⏸ PAUSED]",
+            Style::default()
+                .bg(palette.warning_orange)
+                .fg(palette.surface)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if let Some((ref msg, time)) = app.status_message {
         if time.elapsed().as_secs() < 5 {
             let msg_color = if msg.starts_with("DENIED")
@@ -124,9 +146,15 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
     let palette = app.current_palette();
     let filtered_apps = app.visible_apps();
 
+    let knocking_label = if app.unseen_knocking_count() > 0 {
+        format!("[2] Knocking ({} ●)", app.unseen_knocking_count())
+    } else {
+        "[2] Knocking".to_string()
+    };
+
     let filter_tabs = [
         (ViewFilter::All, "[1] All"),
-        (ViewFilter::KnockingOnly, "[2] Knocking"),
+        (ViewFilter::KnockingOnly, knocking_label.as_str()),
         (ViewFilter::AllowedOnly, "[3] Allowed"),
         (ViewFilter::BlockedOnly, "[4] Blocked"),
     ];
@@ -322,7 +350,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn render_bottom_split(f: &mut Frame, app: &App, area: Rect) {
+fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
     let palette = app.current_palette();
     let filtered_apps = app.visible_apps();
 
@@ -372,6 +400,10 @@ fn render_bottom_split(f: &mut Frame, app: &App, area: Rect) {
                     crate::core::rules::RuleAction::Allow,
                     crate::core::rules::AllowedZoneScope::LanOnly,
                 ) => ("LAN ONLY (Explicit Rule)", palette.lan_yellow),
+                (
+                    crate::core::rules::RuleAction::Allow,
+                    crate::core::rules::AllowedZoneScope::InternetOnly,
+                ) => ("INT ONLY (Explicit Rule)", palette.internet_cyan),
                 (crate::core::rules::RuleAction::Allow, _) => {
                     ("ALLOW (Explicit Rule)", palette.allowed_green)
                 }
@@ -380,7 +412,7 @@ fn render_bottom_split(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
         } else {
-            ("ALLOW (Default Outbound Policy)", palette.fg_muted)
+            ("ALLOW (Default Policy)", palette.fg_muted)
         };
 
         let path_lower = selected_app.app_path.to_lowercase();
@@ -409,6 +441,63 @@ fn render_bottom_split(f: &mut Frame, app: &App, area: Rect) {
                 )
             };
 
+        let meta = app.get_or_load_metadata(&selected_app.app_path);
+        let desc_display = meta.description.as_deref().unwrap_or("-");
+        let sign_badge = meta.signature.badge();
+        let sign_color = match meta.signature {
+            crate::core::process::SignatureStatus::Verified(_) => palette.allowed_green,
+            crate::core::process::SignatureStatus::Unsigned => palette.warning_orange,
+            crate::core::process::SignatureStatus::Untrusted => palette.alert_red,
+            crate::core::process::SignatureStatus::Unknown => palette.fg_muted,
+        };
+
+        let mut desc_sign_spans = vec![
+            Span::styled("Desc: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                fit_width(desc_display, 24),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled("  Sign: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                sign_badge,
+                Style::default().fg(sign_color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if meta.is_suspicious_path {
+            desc_sign_spans.push(Span::styled(
+                " [⚠ SUSPICIOUS PATH]",
+                Style::default()
+                    .bg(palette.alert_red)
+                    .fg(palette.fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        let policy_spans = if let Some(ref svc) = selected_app.service_name {
+            vec![
+                Span::styled("Service: ", Style::default().fg(palette.fg_muted)),
+                Span::styled(
+                    svc,
+                    Style::default()
+                        .fg(palette.internet_cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  Policy: ", Style::default().fg(palette.fg_muted)),
+                Span::styled(
+                    rule_display,
+                    Style::default().fg(rule_color).add_modifier(Modifier::BOLD),
+                ),
+            ]
+        } else {
+            vec![
+                Span::styled("Policy: ", Style::default().fg(palette.fg_muted)),
+                Span::styled(
+                    rule_display,
+                    Style::default().fg(rule_color).add_modifier(Modifier::BOLD),
+                ),
+            ]
+        };
+
         let detail_lines = vec![
             Line::from(vec![
                 Span::styled("App: ", Style::default().fg(palette.fg_muted)),
@@ -429,13 +518,8 @@ fn render_bottom_split(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("Path: ", Style::default().fg(palette.fg_muted)),
                 Span::styled(&selected_app.app_path, Style::default().fg(palette.fg)),
             ]),
-            Line::from(vec![
-                Span::styled("Policy: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(
-                    rule_display,
-                    Style::default().fg(rule_color).add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            Line::from(desc_sign_spans),
+            Line::from(policy_spans),
             Line::from(vec![
                 Span::styled("Win Firewall: ", Style::default().fg(palette.fg_muted)),
                 Span::styled(
@@ -462,12 +546,26 @@ fn render_bottom_split(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::raw("LAN only  "),
                 Span::styled(
+                    "[i] ",
+                    Style::default()
+                        .fg(palette.internet_cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Int only  "),
+                Span::styled(
                     "[d] ",
                     Style::default()
                         .fg(palette.alert_red)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("Deny  "),
+                Span::styled(
+                    "[x] ",
+                    Style::default()
+                        .fg(palette.warning_orange)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Reset  "),
                 Span::styled(
                     "[Enter] ",
                     Style::default()
@@ -506,25 +604,28 @@ fn render_bottom_split(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ("OK  ", palette.allowed_green)
             };
+            let domain = app.dns_resolver.resolve_or_enqueue(event.remote_ip);
+            let endpoint = crate::core::dns::format_recent_activity_endpoint(
+                &event.remote_ip,
+                event.remote_port,
+                &event.protocol,
+                domain.as_deref(),
+            );
             let ev_line = Line::from(vec![
                 Span::styled(
                     format!("[{}] ", act_tag),
                     Style::default().fg(act_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("{:<4} ", event.protocol),
-                    Style::default().fg(palette.port_purple),
-                ),
-                Span::styled(
-                    format!(
-                        "{:<21} ",
-                        format!("{}:{}", event.remote_ip, event.remote_port)
-                    ),
+                    format!("{} ", endpoint),
                     Style::default().fg(palette.fg),
                 ),
                 Span::styled(
                     format!("[{}]", zone_tag),
-                    Style::default().fg(palette.lan_yellow),
+                    Style::default().fg(match event.zone {
+                        Zone::Lan => palette.lan_yellow,
+                        Zone::Internet => palette.internet_cyan,
+                    }),
                 ),
             ]);
             event_lines.push(ev_line);
@@ -589,6 +690,13 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw("lan only │ "),
             Span::styled(
+                "[i] ",
+                Style::default()
+                    .fg(palette.internet_cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("int only │ "),
+            Span::styled(
                 "[d] ",
                 Style::default()
                     .fg(palette.alert_red)
@@ -596,12 +704,19 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw("deny │ "),
             Span::styled(
+                "[x] ",
+                Style::default()
+                    .fg(palette.warning_orange)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("reset │ "),
+            Span::styled(
                 "[/] ",
                 Style::default()
                     .fg(palette.internet_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("search / listeners │ "),
+            Span::raw("search │ "),
             Span::styled(
                 "[s] ",
                 Style::default()
@@ -609,13 +724,6 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("sort │ "),
-            Span::styled(
-                "[r] ",
-                Style::default()
-                    .fg(palette.lan_yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("sync │ "),
             Span::styled(
                 "[q] ",
                 Style::default()
@@ -647,7 +755,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     .fg(palette.internet_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("search / listeners │ "),
+            Span::raw("search │ "),
             Span::styled(
                 "[1-4] ",
                 Style::default()
@@ -662,13 +770,6 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("sort │ "),
-            Span::styled(
-                "[r] ",
-                Style::default()
-                    .fg(palette.lan_yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("sync │ "),
             Span::styled(
                 "[q] ",
                 Style::default()
@@ -841,6 +942,34 @@ fn render_search_or_listener_overlay(f: &mut Frame, app: &App) {
 
             let footer = Line::from(vec![
                 Span::styled(
+                    " [a] ",
+                    Style::default()
+                        .fg(palette.allowed_green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Allow In  "),
+                Span::styled(
+                    " [l] ",
+                    Style::default()
+                        .fg(palette.lan_yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("LAN Only In  "),
+                Span::styled(
+                    " [i] ",
+                    Style::default()
+                        .fg(palette.internet_cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Int Only In  "),
+                Span::styled(
+                    " [d] ",
+                    Style::default()
+                        .fg(palette.alert_red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Block In  "),
+                Span::styled(
                     " [k] ",
                     Style::default()
                         .fg(palette.alert_red)
@@ -971,8 +1100,8 @@ fn render_edit_modal(f: &mut Frame, app: &App) {
     let palette = app.current_palette();
     let area = f.area();
 
-    let width = 64.min(area.width.saturating_sub(4));
-    let height = 10.min(area.height.saturating_sub(4));
+    let width = 76.min(area.width.saturating_sub(4));
+    let height = 15.min(area.height.saturating_sub(2));
     let popup_area = Rect {
         x: (area.width.saturating_sub(width)) / 2,
         y: (area.height.saturating_sub(height)) / 2,
@@ -985,34 +1114,160 @@ fn render_edit_modal(f: &mut Frame, app: &App) {
     let modal_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Custom Rule Editor [Enter to apply, Esc to cancel] ")
+        .title(Span::styled(
+            " Custom Rule Editor [Enter: Save, Del: Reset, Esc: Cancel] ",
+            Style::default()
+                .fg(palette.border_focus)
+                .add_modifier(Modifier::BOLD),
+        ))
         .border_style(Style::default().fg(palette.border_focus))
         .style(Style::default().bg(palette.surface));
 
-    let remote_ip_str = app.edit_remote_ip.as_deref().unwrap_or("any");
-    let content = vec![
-        Line::from(vec![
-            Span::styled("App: ", Style::default().fg(palette.fg_muted)),
-            Span::styled(
-                fit_width(&app.edit_app_path, (width.saturating_sub(10)) as usize),
+    let focus_cursor = |field: RuleEditorField| -> (&'static str, Style) {
+        if app.edit_focused_field == field {
+            (
+                "▶ ",
                 Style::default()
-                    .fg(palette.border_focus)
+                    .fg(palette.warning_orange)
                     .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("  ", Style::default().fg(palette.fg_muted))
+        }
+    };
+
+    let opt_style = |selected: bool| -> Style {
+        if selected {
+            Style::default()
+                .fg(palette.internet_cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.fg_muted)
+        }
+    };
+
+    use crate::core::rules::{AllowedZoneScope, RuleAction, RuleDirection};
+    let mut lines = Vec::new();
+
+    // App path line
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("App: ", Style::default().fg(palette.fg_muted)),
+        Span::styled(
+            fit_width(&app.edit_app_path, (width.saturating_sub(12)) as usize),
+            Style::default()
+                .fg(palette.border_focus)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Action field
+    let (cur, cur_style) = focus_cursor(RuleEditorField::Action);
+    lines.push(Line::from(vec![
+        Span::styled(cur, cur_style),
+        Span::styled("Action:      ", Style::default().fg(palette.fg)),
+        Span::styled("[Allow]", opt_style(app.edit_action == RuleAction::Allow)),
+        Span::raw("  "),
+        Span::styled("[Block]", opt_style(app.edit_action == RuleAction::Block)),
+    ]));
+
+    // Direction field
+    let (cur, cur_style) = focus_cursor(RuleEditorField::Direction);
+    lines.push(Line::from(vec![
+        Span::styled(cur, cur_style),
+        Span::styled("Direction:   ", Style::default().fg(palette.fg)),
+        Span::styled(
+            "[Outbound]",
+            opt_style(app.edit_direction == RuleDirection::Outbound),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "[Inbound]",
+            opt_style(app.edit_direction == RuleDirection::Inbound),
+        ),
+    ]));
+
+    // Zone / Scope field
+    let (cur, cur_style) = focus_cursor(RuleEditorField::ZoneScope);
+    lines.push(Line::from(vec![
+        Span::styled(cur, cur_style),
+        Span::styled("Zone / Scope:", Style::default().fg(palette.fg)),
+        Span::raw(" "),
+        Span::styled(
+            "[All (LAN+Inet)]",
+            opt_style(
+                !app.edit_custom_ip_mode && app.edit_zone_scope == AllowedZoneScope::Both,
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Remote IP: ", Style::default().fg(palette.fg_muted)),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "[LAN Only]",
+            opt_style(
+                !app.edit_custom_ip_mode && app.edit_zone_scope == AllowedZoneScope::LanOnly,
+            ),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "[Internet Only]",
+            opt_style(
+                !app.edit_custom_ip_mode && app.edit_zone_scope == AllowedZoneScope::InternetOnly,
+            ),
+        ),
+        Span::raw(" "),
+        Span::styled("[Custom IP]", opt_style(app.edit_custom_ip_mode)),
+    ]));
+
+    // Custom IP field (if Custom IP mode is active)
+    if app.edit_custom_ip_mode {
+        let (cur, cur_style) = focus_cursor(RuleEditorField::CustomIp);
+        let cursor_char = if app.edit_focused_field == RuleEditorField::CustomIp {
+            "█"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(cur, cur_style),
+            Span::styled("Custom IP:   ", Style::default().fg(palette.fg)),
             Span::styled(
-                remote_ip_str,
+                &app.edit_custom_ip,
                 Style::default()
                     .fg(palette.internet_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
+            Span::styled(cursor_char, Style::default().fg(palette.warning_orange)),
+            Span::styled(
+                " (e.g. 1.1.1.1 or 192.168.1.0/24)",
+                Style::default().fg(palette.fg_muted),
+            ),
+        ]));
+    }
+
+    // Protocol field
+    let (cur, cur_style) = focus_cursor(RuleEditorField::Protocol);
+    let proto_cur = app.edit_protocol.to_uppercase();
+    lines.push(Line::from(vec![
+        Span::styled(cur, cur_style),
+        Span::styled("Protocol:    ", Style::default().fg(palette.fg)),
+        Span::styled("[TCP]", opt_style(proto_cur == "TCP")),
+        Span::raw("  "),
+        Span::styled("[UDP]", opt_style(proto_cur == "UDP")),
+        Span::raw("  "),
+        Span::styled("[Any]", opt_style(proto_cur == "ANY")),
+    ]));
+
+    // Ports field (if Protocol is not ANY)
+    if proto_cur != "ANY" {
+        let (cur, cur_style) = focus_cursor(RuleEditorField::Ports);
+        let cursor_char = if app.edit_focused_field == RuleEditorField::Ports {
+            "█"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(cur, cur_style),
             Span::styled(
                 "Specify ports (e.g. 80,443 or *): ",
-                Style::default().fg(palette.fg_muted),
+                Style::default().fg(palette.fg),
             ),
             Span::styled(
                 &app.edit_ports,
@@ -1020,36 +1275,67 @@ fn render_edit_modal(f: &mut Frame, app: &App) {
                     .fg(palette.port_purple)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Protocol: ", Style::default().fg(palette.fg_muted)),
-            Span::styled(
-                &app.edit_protocol,
-                Style::default()
-                    .fg(palette.lan_yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(
-                "[Enter] ",
-                Style::default()
-                    .fg(palette.allowed_green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Apply Rule   "),
-            Span::styled(
-                "[Esc] ",
-                Style::default()
-                    .fg(palette.fg_muted)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Cancel"),
-        ]),
-    ];
+            Span::styled(cursor_char, Style::default().fg(palette.warning_orange)),
+        ]));
+    }
 
-    let p = Paragraph::new(content).block(modal_block);
+    // Service Target field (if service_name is present)
+    if let Some(ref svc) = app.edit_service_name {
+        let (cur, cur_style) = focus_cursor(RuleEditorField::ServiceOnly);
+        lines.push(Line::from(vec![
+            Span::styled(cur, cur_style),
+            Span::styled("Target:      ", Style::default().fg(palette.fg)),
+            Span::styled("[App Binary]", opt_style(!app.edit_apply_to_service)),
+            Span::raw("  "),
+            Span::styled(
+                format!("[Service: {}]", svc),
+                opt_style(app.edit_apply_to_service),
+            ),
+        ]));
+    }
+
+    // Error line
+    if let Some(ref err) = app.edit_error {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("⚠ {}", err),
+                Style::default()
+                    .fg(palette.alert_red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    } else {
+        lines.push(Line::raw(""));
+    }
+
+    // Footer actions
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "[Enter] ",
+            Style::default()
+                .fg(palette.allowed_green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Save   "),
+        Span::styled(
+            "[Del] ",
+            Style::default()
+                .fg(palette.warning_orange)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Remove Rule   "),
+        Span::styled(
+            "[Esc] ",
+            Style::default()
+                .fg(palette.fg_muted)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Cancel"),
+    ]));
+
+    let p = Paragraph::new(lines).block(modal_block);
     f.render_widget(p, popup_area);
 }
 

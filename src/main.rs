@@ -45,8 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let os_rules = crate::core::firewall::WindowsFirewallManager::load_outbound_rules_from_os();
     app.sync_from_os_rules(os_rules);
 
-    // 2. Ініціалізуємо WFP Drop Monitor для перехоплення відкинутих пакетів (TCP SYN / UDP drops)
+    // 2. Ініціалізуємо WFP Drop Monitor та Registry Watcher
     let mut wfp_monitor = WfpDropMonitor::new();
+    let watcher = crate::core::watcher::FirewallRegistryWatcher::start();
+    app.set_watcher(watcher.clone());
 
     // 3. Початкове сканування всіх активних та відкинутих мережевих з'єднань у системі
     let initial_events = scan_current_network_connections();
@@ -60,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.sync_selection();
 
     // Запуск головного циклу подій TUI
-    let res = run_app(&mut terminal, &mut app, &mut wfp_monitor);
+    let res = run_app(&mut terminal, &mut app, &mut wfp_monitor, &watcher);
 
     // Відновлення терміналу
     disable_raw_mode()?;
@@ -78,20 +80,43 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     wfp_monitor: &mut WfpDropMonitor,
+    watcher: &crate::core::watcher::FirewallRegistryWatcher,
 ) -> io::Result<()> {
     let mut last_scan = std::time::Instant::now();
 
     loop {
+        // Фонова перевірка зовнішніх змін у реєстрі Windows Firewall
+        if let Some(crate::core::watcher::FirewallWatchEvent::ExternalChangeDetected) =
+            watcher.try_recv()
+        {
+            let active_its_fw_rules =
+                crate::core::firewall::WindowsFirewallManager::load_active_its_fw_rules();
+            app.verified_fw_rules = active_its_fw_rules;
+            let dir = match app.active_direction {
+                crate::tui::app::FirewallDirection::Outbound => {
+                    crate::core::rules::RuleDirection::Outbound
+                }
+                crate::tui::app::FirewallDirection::Inbound => {
+                    crate::core::rules::RuleDirection::Inbound
+                }
+            };
+            let os_rules = crate::core::firewall::WindowsFirewallManager::load_rules_from_os(dir);
+            app.sync_from_os_rules(os_rules);
+            app.set_status("Synced external firewall changes".into());
+        }
+
         // Періодичне фонове підсканування активних з'єднань та WFP Drop подій кожні 2 секунди
         if last_scan.elapsed() >= std::time::Duration::from_secs(2) {
-            let events = scan_current_network_connections();
-            for ev in events {
-                app.aggregator.record_event(ev);
+            if !app.stream_paused {
+                let events = scan_current_network_connections();
+                for ev in events {
+                    app.record_incoming_event(ev);
+                }
+                for drop_ev in wfp_monitor.poll_dropped_events() {
+                    app.record_incoming_event(drop_ev);
+                }
+                app.sync_selection();
             }
-            for drop_ev in wfp_monitor.poll_dropped_events() {
-                app.aggregator.record_event(drop_ev);
-            }
-            app.sync_selection();
             last_scan = std::time::Instant::now();
         }
 
@@ -151,9 +176,47 @@ fn run_app<B: ratatui::backend::Backend>(
 
                 if app.edit_mode {
                     match key.code {
-                        KeyCode::Esc => app.edit_mode = false,
+                        KeyCode::Esc => {
+                            app.edit_mode = false;
+                            app.edit_error = None;
+                        }
+                        KeyCode::Tab | KeyCode::Down => {
+                            app.editor_next_field();
+                        }
+                        KeyCode::BackTab | KeyCode::Up => {
+                            app.editor_prev_field();
+                        }
+                        KeyCode::Left => {
+                            app.editor_cycle_option(false);
+                        }
+                        KeyCode::Right => {
+                            app.editor_cycle_option(true);
+                        }
+                        KeyCode::Char(' ') => {
+                            match app.edit_focused_field {
+                                crate::tui::app::RuleEditorField::CustomIp
+                                | crate::tui::app::RuleEditorField::Ports => {}
+                                _ => {
+                                    app.editor_cycle_option(true);
+                                }
+                            }
+                        }
                         KeyCode::Enter => {
                             app.save_prefilled_rule();
+                        }
+                        KeyCode::Delete => {
+                            app.delete_rule_from_editor();
+                        }
+                        KeyCode::Char('d')
+                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            app.delete_rule_from_editor();
+                        }
+                        KeyCode::Backspace => {
+                            app.editor_backspace();
+                        }
+                        KeyCode::Char(c) => {
+                            app.editor_input_char(c);
                         }
                         _ => {}
                     }
@@ -189,6 +252,30 @@ fn run_app<B: ratatui::backend::Backend>(
                             if app.listening_mode {
                                 app.prev_listening_socket();
                             }
+                        }
+                        KeyCode::Char('a') if app.listening_mode => {
+                            app.apply_listener_inbound_rule(
+                                crate::core::rules::RuleAction::Allow,
+                                crate::core::rules::AllowedZoneScope::Both,
+                            );
+                        }
+                        KeyCode::Char('l') if app.listening_mode => {
+                            app.apply_listener_inbound_rule(
+                                crate::core::rules::RuleAction::Allow,
+                                crate::core::rules::AllowedZoneScope::LanOnly,
+                            );
+                        }
+                        KeyCode::Char('i') if app.listening_mode => {
+                            app.apply_listener_inbound_rule(
+                                crate::core::rules::RuleAction::Allow,
+                                crate::core::rules::AllowedZoneScope::InternetOnly,
+                            );
+                        }
+                        KeyCode::Char('d') if app.listening_mode => {
+                            app.apply_listener_inbound_rule(
+                                crate::core::rules::RuleAction::Block,
+                                crate::core::rules::AllowedZoneScope::Both,
+                            );
                         }
                         KeyCode::Char('k') if app.listening_mode => {
                             let _ = app.kill_selected_listening_pid();
@@ -256,6 +343,11 @@ fn run_app<B: ratatui::backend::Backend>(
                             app.allow_selected_lan_only(&path);
                         }
                     }
+                    KeyCode::Char('i') => {
+                        if let Some((path, _, _)) = selected_app_info {
+                            app.allow_selected_internet_only(&path);
+                        }
+                    }
                     KeyCode::Char('p') => {
                         if let Some((path, port, proto)) = selected_app_info {
                             app.allow_selected_current_port(&path, port, &proto);
@@ -266,6 +358,17 @@ fn run_app<B: ratatui::backend::Backend>(
                             app.block_selected(&path);
                         }
                     }
+                    KeyCode::Char('x') | KeyCode::Delete => {
+                        if let Some((path, _, _)) = selected_app_info {
+                            app.reset_selected_rule(&path);
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        app.toggle_stream_pause();
+                    }
+                    KeyCode::F(12) | KeyCode::Char('L') => {
+                        app.toggle_lockdown();
+                    }
                     KeyCode::Char('s') => {
                         app.toggle_sort_menu();
                     }
@@ -275,11 +378,19 @@ fn run_app<B: ratatui::backend::Backend>(
                             crate::core::firewall::WindowsFirewallManager::load_active_its_fw_rules(
                             );
                         app.verified_fw_rules = active_its_fw_rules;
-                        let os_rules = crate::core::firewall::WindowsFirewallManager::load_outbound_rules_from_os();
+                        let dir = match app.active_direction {
+                            crate::tui::app::FirewallDirection::Outbound => {
+                                crate::core::rules::RuleDirection::Outbound
+                            }
+                            crate::tui::app::FirewallDirection::Inbound => {
+                                crate::core::rules::RuleDirection::Inbound
+                            }
+                        };
+                        let os_rules = crate::core::firewall::WindowsFirewallManager::load_rules_from_os(dir);
                         let count = os_rules.len();
                         app.sync_from_os_rules(os_rules);
                         for drop_ev in wfp_monitor.poll_dropped_events() {
-                            app.aggregator.record_event(drop_ev);
+                            app.record_incoming_event(drop_ev);
                         }
                         app.latch_sort_snapshot();
                         app.sync_selection();

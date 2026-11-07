@@ -42,7 +42,7 @@ pub struct ProcessMetadata {
 
 pub fn is_shared_service_host(exe_name: &str) -> bool {
     let filename = exe_name
-        .rsplit(|c| c == '/' || c == '\\')
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(exe_name);
     matches!(

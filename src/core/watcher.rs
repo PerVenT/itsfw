@@ -127,11 +127,11 @@ fn run_watcher_loop(tx: Sender<FirewallWatchEvent>, last_self_mutation_ms: Arc<A
         let now = current_time_ms();
         let last = last_self_mutation_ms.load(Ordering::SeqCst);
 
-        if !should_suppress_event(last, now, SELF_MUTATION_SUPPRESSION_MS) {
-            if tx.send(FirewallWatchEvent::ExternalChangeDetected).is_err() {
-                // Receiver was dropped, exit thread
-                break;
-            }
+        if !should_suppress_event(last, now, SELF_MUTATION_SUPPRESSION_MS)
+            && tx.send(FirewallWatchEvent::ExternalChangeDetected).is_err()
+        {
+            // Receiver was dropped, exit thread
+            break;
         }
     }
 

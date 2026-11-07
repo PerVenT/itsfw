@@ -71,6 +71,17 @@ impl SortMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleEditorField {
+    Action,      // [Allow | Block]
+    Direction,   // [Outbound | Inbound]
+    ZoneScope,   // [All (LAN+Inet) | LAN Only | Internet Only | Custom IP/CIDR]
+    CustomIp,    // Editable string when ZoneScope == CustomIp
+    Protocol,    // [TCP | UDP | Any]
+    Ports,       // Editable string ("80,443", "8000-8080", "*") when Protocol != Any
+    ServiceOnly, // [App Binary | Service: <name>] (shown/active when service_name is present)
+}
+
 pub struct App {
     pub should_quit: bool,
     pub is_admin: bool,
@@ -97,6 +108,21 @@ pub struct App {
     pub edit_remote_ip: Option<String>,
     pub edit_ports: String,
     pub edit_protocol: String,
+    pub edit_focused_field: RuleEditorField,
+    pub edit_action: RuleAction,
+    pub edit_direction: RuleDirection,
+    pub edit_zone_scope: AllowedZoneScope,
+    pub edit_custom_ip_mode: bool,
+    pub edit_custom_ip: String,
+    pub edit_service_name: Option<String>,
+    pub edit_apply_to_service: bool,
+    pub edit_error: Option<String>,
+    pub stream_paused: bool,
+    pub lockdown_active: bool,
+    pub unseen_knocking: std::collections::HashSet<String>,
+    pub metadata_cache: std::collections::HashMap<String, crate::core::process::ProcessMetadata>,
+    pub dns_resolver: crate::core::dns::DnsResolver,
+    pub watcher: Option<crate::core::watcher::FirewallRegistryWatcher>,
     pub status_message: Option<(String, std::time::Instant)>,
 }
 
@@ -134,6 +160,21 @@ impl App {
             edit_remote_ip: None,
             edit_ports: "80,443".into(),
             edit_protocol: "TCP".into(),
+            edit_focused_field: RuleEditorField::Action,
+            edit_action: RuleAction::Allow,
+            edit_direction: RuleDirection::Outbound,
+            edit_zone_scope: AllowedZoneScope::Both,
+            edit_custom_ip_mode: false,
+            edit_custom_ip: String::new(),
+            edit_service_name: None,
+            edit_apply_to_service: false,
+            edit_error: None,
+            stream_paused: false,
+            lockdown_active: crate::core::firewall::WindowsFirewallManager::is_lockdown_active(),
+            unseen_knocking: std::collections::HashSet::new(),
+            metadata_cache: std::collections::HashMap::new(),
+            dns_resolver: crate::core::dns::DnsResolver::default(),
+            watcher: None,
             status_message: None,
         }
     }
@@ -304,9 +345,30 @@ impl App {
         self.sync_selection();
     }
 
+    pub fn rule_for_app_entry(
+        &self,
+        item: &crate::core::monitor::AppActivitySummary,
+    ) -> Option<&AppRule> {
+        let key = crate::core::rules::make_app_key(
+            &item.app_path,
+            item.service_name.as_deref(),
+            item.direction,
+        );
+        self.active_rules
+            .get(&key)
+            .or_else(|| self.active_rules.get(&item.app_path.to_lowercase()))
+    }
+
     /// Повертає активне правило Windows Firewall для заданого шляху додатку (регістронезалежно).
     pub fn rule_for_app(&self, app_path: &str) -> Option<&AppRule> {
-        self.active_rules.get(&app_path.to_lowercase())
+        let dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
+        let app_key = crate::core::rules::make_app_key(app_path, None, dir);
+        self.active_rules
+            .get(&app_key)
+            .or_else(|| self.active_rules.get(&app_path.to_lowercase()))
     }
 
     /// Фіксує курсор на вибраному додатку (`selected_app_path`), щоб список не стрибав при появі нових процесів.
@@ -342,10 +404,17 @@ impl App {
     /// Єдине джерело правди для рендерингу, навігації та виконання дій!
     pub fn visible_apps(&self) -> Vec<crate::core::monitor::AppActivitySummary> {
         let all_apps = self.aggregator.get_sorted_list();
+        let target_dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
 
         let mut filtered: Vec<crate::core::monitor::AppActivitySummary> = all_apps
             .into_iter()
             .filter(|app_item| {
+                if app_item.direction != target_dir {
+                    return false;
+                }
                 if !self.search_query.is_empty()
                     && !app_item
                         .app_name
@@ -359,7 +428,7 @@ impl App {
                     ViewFilter::KnockingOnly => app_item.is_knocking && app_item.total_hits > 0,
                     ViewFilter::AllowedOnly => !app_item.is_knocking,
                     ViewFilter::BlockedOnly => self
-                        .rule_for_app(&app_item.app_path)
+                        .rule_for_app_entry(app_item)
                         .map(|r| r.action == RuleAction::Block)
                         .unwrap_or(false),
                 }
@@ -411,7 +480,7 @@ impl App {
             }
             SortMode::StatusPriority => {
                 let status_rank = |item: &crate::core::monitor::AppActivitySummary| -> u8 {
-                    let rule = self.rule_for_app(&item.app_path);
+                    let rule = self.rule_for_app_entry(item);
                     let is_explicit_block =
                         rule.map(|r| r.action == RuleAction::Block).unwrap_or(false);
                     if item.is_knocking && !is_explicit_block {
@@ -449,6 +518,9 @@ impl App {
 
     pub fn set_filter(&mut self, filter: ViewFilter, name: &str) {
         self.current_filter = filter;
+        if filter == ViewFilter::KnockingOnly {
+            self.unseen_knocking.clear();
+        }
         self.selected_index = 0;
         self.selected_app_path = None;
         self.sync_selection();
@@ -535,51 +607,297 @@ impl App {
         }
 
         self.edit_app_path = app_path.to_string();
-        if let Some(summary) = self.aggregator.apps.get(&app_path.to_lowercase()) {
-            if let Some(last_ev) = summary.recent_events.last() {
-                self.edit_remote_ip = Some(last_ev.remote_ip.to_string());
-                self.edit_ports = last_ev.remote_port.to_string();
-                self.edit_protocol = last_ev.protocol.clone();
+        self.edit_mode = true;
+        self.edit_focused_field = RuleEditorField::Action;
+        self.edit_error = None;
+
+        let active_rule_dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
+
+        if let Some(existing) = self.rule_for_app(app_path).cloned() {
+            self.edit_action = existing.action;
+            self.edit_direction = existing.direction;
+            self.edit_zone_scope = existing.zone_scope;
+            self.edit_custom_ip_mode = existing.custom_remote_ip.is_some();
+            self.edit_custom_ip = existing.custom_remote_ip.clone().unwrap_or_default();
+            self.edit_remote_ip = existing.custom_remote_ip;
+            self.edit_ports = existing.ports;
+            self.edit_protocol = match existing.protocol {
+                NetProtocol::Tcp => "TCP".into(),
+                NetProtocol::Udp => "UDP".into(),
+                NetProtocol::Any => "ANY".into(),
+            };
+            self.edit_service_name = existing.service_name.clone();
+            self.edit_apply_to_service = existing.service_name.is_some();
+        } else {
+            self.edit_action = RuleAction::Allow;
+            self.edit_direction = active_rule_dir;
+            self.edit_zone_scope = AllowedZoneScope::Both;
+            self.edit_custom_ip_mode = false;
+            self.edit_custom_ip = String::new();
+            self.edit_remote_ip = None;
+
+            let app_key = crate::core::rules::make_app_key(app_path, None, active_rule_dir);
+            let summary = self
+                .aggregator
+                .apps
+                .get(&app_key)
+                .or_else(|| self.aggregator.apps.get(&app_path.to_lowercase()));
+
+            if let Some(summary) = summary {
+                self.edit_service_name = summary.service_name.clone();
+                self.edit_apply_to_service = summary.service_name.is_some();
+                if let Some(last_ev) = summary.recent_events.last() {
+                    self.edit_remote_ip = Some(last_ev.remote_ip.to_string());
+                    self.edit_custom_ip = last_ev.remote_ip.to_string();
+                    self.edit_ports = last_ev.remote_port.to_string();
+                    self.edit_protocol = last_ev.protocol.clone();
+                } else {
+                    self.edit_ports = summary.all_ports_list();
+                    self.edit_protocol = "TCP".into();
+                }
             } else {
-                self.edit_remote_ip = None;
-                self.edit_ports = summary.all_ports_list();
+                self.edit_service_name = None;
+                self.edit_apply_to_service = false;
+                self.edit_ports = "80,443".into();
                 self.edit_protocol = "TCP".into();
             }
-        } else {
-            self.edit_remote_ip = None;
-            self.edit_ports = "80,443".into();
-            self.edit_protocol = "TCP".into();
         }
-
-        self.edit_mode = true;
     }
 
-    pub fn save_prefilled_rule(&mut self) {
-        if self.edit_app_path.is_empty() {
-            return;
+    pub fn editor_active_fields(&self) -> Vec<RuleEditorField> {
+        let mut fields = vec![
+            RuleEditorField::Action,
+            RuleEditorField::Direction,
+            RuleEditorField::ZoneScope,
+        ];
+        if self.edit_custom_ip_mode {
+            fields.push(RuleEditorField::CustomIp);
         }
+        fields.push(RuleEditorField::Protocol);
         let proto = match self.edit_protocol.to_uppercase().as_str() {
             "UDP" => NetProtocol::Udp,
+            "ANY" => NetProtocol::Any,
             _ => NetProtocol::Tcp,
         };
+        if proto != NetProtocol::Any {
+            fields.push(RuleEditorField::Ports);
+        }
+        if self.edit_service_name.is_some() {
+            fields.push(RuleEditorField::ServiceOnly);
+        }
+        fields
+    }
+
+    pub fn editor_next_field(&mut self) {
+        let fields = self.editor_active_fields();
+        if fields.is_empty() {
+            return;
+        }
+        let pos = fields
+            .iter()
+            .position(|f| *f == self.edit_focused_field)
+            .unwrap_or(0);
+        let next_pos = (pos + 1) % fields.len();
+        self.edit_focused_field = fields[next_pos];
+    }
+
+    pub fn editor_prev_field(&mut self) {
+        let fields = self.editor_active_fields();
+        if fields.is_empty() {
+            return;
+        }
+        let pos = fields
+            .iter()
+            .position(|f| *f == self.edit_focused_field)
+            .unwrap_or(0);
+        let prev_pos = if pos == 0 {
+            fields.len() - 1
+        } else {
+            pos - 1
+        };
+        self.edit_focused_field = fields[prev_pos];
+    }
+
+    pub fn editor_cycle_option(&mut self, forward: bool) {
+        match self.edit_focused_field {
+            RuleEditorField::Action => {
+                self.edit_action = match self.edit_action {
+                    RuleAction::Allow => RuleAction::Block,
+                    RuleAction::Block => RuleAction::Allow,
+                };
+            }
+            RuleEditorField::Direction => {
+                self.edit_direction = match self.edit_direction {
+                    RuleDirection::Outbound => RuleDirection::Inbound,
+                    RuleDirection::Inbound => RuleDirection::Outbound,
+                };
+            }
+            RuleEditorField::ZoneScope => {
+                let cur = if self.edit_custom_ip_mode {
+                    3
+                } else {
+                    match self.edit_zone_scope {
+                        AllowedZoneScope::Both => 0,
+                        AllowedZoneScope::LanOnly => 1,
+                        AllowedZoneScope::InternetOnly => 2,
+                    }
+                };
+                let next = if forward {
+                    (cur + 1) % 4
+                } else if cur == 0 {
+                    3
+                } else {
+                    cur - 1
+                };
+                match next {
+                    0 => {
+                        self.edit_custom_ip_mode = false;
+                        self.edit_zone_scope = AllowedZoneScope::Both;
+                    }
+                    1 => {
+                        self.edit_custom_ip_mode = false;
+                        self.edit_zone_scope = AllowedZoneScope::LanOnly;
+                    }
+                    2 => {
+                        self.edit_custom_ip_mode = false;
+                        self.edit_zone_scope = AllowedZoneScope::InternetOnly;
+                    }
+                    _ => {
+                        self.edit_custom_ip_mode = true;
+                        self.edit_zone_scope = AllowedZoneScope::Both;
+                    }
+                }
+            }
+            RuleEditorField::Protocol => {
+                let protos = ["TCP", "UDP", "ANY"];
+                let cur = self.edit_protocol.to_uppercase();
+                let pos = protos.iter().position(|p| *p == cur).unwrap_or(0);
+                let next_pos = if forward {
+                    (pos + 1) % protos.len()
+                } else if pos == 0 {
+                    protos.len() - 1
+                } else {
+                    pos - 1
+                };
+                self.edit_protocol = protos[next_pos].to_string();
+            }
+            RuleEditorField::ServiceOnly => {
+                self.edit_apply_to_service = !self.edit_apply_to_service;
+            }
+            RuleEditorField::CustomIp | RuleEditorField::Ports => {
+                // Text fields do not cycle options
+            }
+        }
+    }
+
+    pub fn editor_input_char(&mut self, c: char) {
+        self.edit_error = None;
+        match self.edit_focused_field {
+            RuleEditorField::CustomIp => {
+                self.edit_custom_ip.push(c);
+                self.edit_remote_ip = Some(self.edit_custom_ip.clone());
+            }
+            RuleEditorField::Ports => {
+                self.edit_ports.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn editor_backspace(&mut self) {
+        self.edit_error = None;
+        match self.edit_focused_field {
+            RuleEditorField::CustomIp => {
+                self.edit_custom_ip.pop();
+                self.edit_remote_ip = if self.edit_custom_ip.is_empty() {
+                    None
+                } else {
+                    Some(self.edit_custom_ip.clone())
+                };
+            }
+            RuleEditorField::Ports => {
+                self.edit_ports.pop();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn delete_rule_from_editor(&mut self) {
+        if !self.edit_app_path.is_empty() {
+            let path = self.edit_app_path.clone();
+            self.reset_selected_rule(&path);
+        }
+        self.edit_mode = false;
+        self.edit_error = None;
+    }
+
+    pub fn save_prefilled_rule(&mut self) -> bool {
+        if self.edit_app_path.is_empty() {
+            return false;
+        }
+        if !self.require_admin("Save Rule") {
+            return false;
+        }
+
+        let proto = match self.edit_protocol.to_uppercase().as_str() {
+            "UDP" => NetProtocol::Udp,
+            "ANY" => NetProtocol::Any,
+            _ => NetProtocol::Tcp,
+        };
+
+        // Validate ports
+        let validated_ports =
+            match crate::core::rules::validate_ports_spec(&self.edit_ports, proto) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.edit_error = Some(e);
+                    return false;
+                }
+            };
+
+        // Validate custom IP if applicable
+        let custom_remote_ip = if self.edit_custom_ip_mode {
+            match crate::core::rules::validate_ip_or_cidr_spec(&self.edit_custom_ip) {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    self.edit_error = Some(e);
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+
+        self.edit_ports = validated_ports.clone();
+        self.edit_error = None;
+
         let rule = AppRule {
             app_path: self.edit_app_path.clone(),
-            service_name: None,
-            direction: RuleDirection::Outbound,
-            action: RuleAction::Allow,
-            zone_scope: AllowedZoneScope::Both,
-            custom_remote_ip: None,
+            service_name: if self.edit_apply_to_service {
+                self.edit_service_name.clone()
+            } else {
+                None
+            },
+            direction: self.edit_direction,
+            action: self.edit_action,
+            zone_scope: self.edit_zone_scope,
+            custom_remote_ip,
             protocol: proto,
-            ports: self.edit_ports.clone(),
+            ports: validated_ports,
             interface_name: None,
             created_at: crate::core::monitor::current_timestamp_secs() as i64,
         };
+
         let msg = format!(
-            "Rule Applied: {} ({}:{})",
-            self.edit_app_path, self.edit_protocol, self.edit_ports
+            "Rule Applied: {} ({:?} {:?})",
+            self.edit_app_path, self.edit_direction, self.edit_action
         );
         self.apply_rule_internal(rule, &msg);
         self.edit_mode = false;
+        true
     }
 
     /// Дозволяє вибраний додаток у LAN + Internet
@@ -587,10 +905,14 @@ impl App {
         if !self.require_admin("Allow All") {
             return;
         }
+        let dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
             service_name: None,
-            direction: RuleDirection::Outbound,
+            direction: dir,
             action: RuleAction::Allow,
             zone_scope: AllowedZoneScope::Both,
             custom_remote_ip: None,
@@ -608,10 +930,14 @@ impl App {
         if !self.require_admin("Allow LAN Only") {
             return;
         }
+        let dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
             service_name: None,
-            direction: RuleDirection::Outbound,
+            direction: dir,
             action: RuleAction::Allow,
             zone_scope: AllowedZoneScope::LanOnly,
             custom_remote_ip: None,
@@ -622,6 +948,31 @@ impl App {
         };
 
         self.apply_rule_internal(rule, "Allowed: LAN Only");
+    }
+
+    /// Дозволяє вибраний додаток ТІЛЬКИ в Інтернет (блокує LAN)
+    pub fn allow_selected_internet_only(&mut self, selected_app_path: &str) {
+        if !self.require_admin("Allow Internet Only") {
+            return;
+        }
+        let dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
+        let rule = AppRule {
+            app_path: selected_app_path.to_string(),
+            service_name: None,
+            direction: dir,
+            action: RuleAction::Allow,
+            zone_scope: AllowedZoneScope::InternetOnly,
+            custom_remote_ip: None,
+            protocol: NetProtocol::Any,
+            ports: "*".into(),
+            interface_name: None,
+            created_at: crate::core::monitor::current_timestamp_secs() as i64,
+        };
+
+        self.apply_rule_internal(rule, "Allowed: Internet Only");
     }
 
     /// Дозволяє поточний порт, куди стукав додаток
@@ -639,11 +990,15 @@ impl App {
             "UDP" => NetProtocol::Udp,
             _ => NetProtocol::Any,
         };
+        let dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
 
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
             service_name: None,
-            direction: RuleDirection::Outbound,
+            direction: dir,
             action: RuleAction::Allow,
             zone_scope: AllowedZoneScope::Both,
             custom_remote_ip: None,
@@ -662,10 +1017,14 @@ impl App {
         if !self.require_admin("Deny App") {
             return;
         }
+        let dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
             service_name: None,
-            direction: RuleDirection::Outbound,
+            direction: dir,
             action: RuleAction::Block,
             zone_scope: AllowedZoneScope::Both,
             custom_remote_ip: None,
@@ -678,12 +1037,184 @@ impl App {
         self.apply_rule_internal(rule, "DENY");
     }
 
+    /// Скидає правило для додатка (Reset to default)
+    pub fn reset_selected_rule(&mut self, app_path: &str) {
+        if !self.require_admin("Reset Rule") {
+            return;
+        }
+        if let Some(ref w) = self.watcher {
+            w.mark_self_mutation();
+        }
+        let dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
+        let key = app_path.to_lowercase();
+        let app_key = crate::core::rules::make_app_key(app_path, None, dir);
+
+        #[cfg(windows)]
+        {
+            if let Ok(mgr) = WindowsFirewallManager::new() {
+                let _ = mgr.remove_app_rules_for(app_path, None, dir);
+            }
+        }
+
+        self.active_rules.remove(&key);
+        self.active_rules.remove(&app_key);
+        self.verified_fw_rules.remove(&key);
+        self.verified_fw_rules.remove(&app_key);
+        self.aggregator.blocked_paths_or_names.remove(&key);
+        self.aggregator.blocked_paths_or_names.remove(&app_key);
+
+        let filename = app_path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        if !filename.is_empty() {
+            self.aggregator.blocked_paths_or_names.remove(&filename);
+        }
+
+        if let Some(app_item) = self.aggregator.apps.get_mut(&key) {
+            app_item.is_knocking = false;
+        }
+        if let Some(app_item) = self.aggregator.apps.get_mut(&app_key) {
+            app_item.is_knocking = false;
+        }
+
+        self.set_status(format!("Rule removed (reset to default): {}", app_path));
+        self.sync_selection();
+    }
+
+    pub fn toggle_stream_pause(&mut self) {
+        self.stream_paused = !self.stream_paused;
+        let msg = if self.stream_paused {
+            "Network activity stream PAUSED"
+        } else {
+            "Network activity stream RESUMED"
+        };
+        self.set_status(msg.to_string());
+    }
+
+    pub fn toggle_lockdown(&mut self) {
+        if !self.require_admin("Toggle Lockdown") {
+            return;
+        }
+        let target = !self.lockdown_active;
+        match crate::core::firewall::WindowsFirewallManager::set_lockdown(target) {
+            Ok(_) => {
+                self.lockdown_active = target;
+                let msg = if target {
+                    "🚨 LOCKDOWN ACTIVATED: All inbound & outbound traffic blocked"
+                } else {
+                    "Lockdown deactivated: Standard policy restored"
+                };
+                self.set_status(msg.to_string());
+            }
+            Err(e) => {
+                self.set_status(format!("ERROR: Failed to toggle lockdown: {}", e));
+            }
+        }
+    }
+
+    pub fn record_incoming_event(&mut self, ev: crate::core::monitor::NetworkEvent) {
+        if ev.is_blocked && self.current_filter != ViewFilter::KnockingOnly {
+            let key = crate::core::rules::make_app_key(
+                &ev.app_path,
+                ev.service_name.as_deref(),
+                ev.direction,
+            );
+            self.unseen_knocking.insert(key);
+        }
+        self.aggregator.record_event(ev);
+    }
+
+    pub fn unseen_knocking_count(&self) -> usize {
+        self.unseen_knocking.len()
+    }
+
+    pub fn apply_listener_inbound_rule(
+        &mut self,
+        action: RuleAction,
+        zone_scope: AllowedZoneScope,
+    ) {
+        if !self.require_admin("Apply Inbound Listener Rule") {
+            return;
+        }
+        let filtered = self.filtered_listening_sockets();
+        let target = match filtered.get(self.listening_selected_index) {
+            Some(s) => (*s).clone(),
+            None => {
+                self.set_status("No listening socket selected".into());
+                return;
+            }
+        };
+
+        let proto = match target.protocol.to_uppercase().as_str() {
+            "TCP" => NetProtocol::Tcp,
+            "UDP" => NetProtocol::Udp,
+            _ => NetProtocol::Any,
+        };
+
+        let rule = AppRule {
+            app_path: target.app_path.clone(),
+            service_name: None,
+            direction: RuleDirection::Inbound,
+            action,
+            zone_scope,
+            custom_remote_ip: None,
+            protocol: proto,
+            ports: target.port.to_string(),
+            interface_name: None,
+            created_at: crate::core::monitor::current_timestamp_secs() as i64,
+        };
+
+        let action_str = match (action, zone_scope) {
+            (RuleAction::Allow, AllowedZoneScope::Both) => "Inbound Allow (All)",
+            (RuleAction::Allow, AllowedZoneScope::LanOnly) => "Inbound Allow (LAN Only)",
+            (RuleAction::Allow, AllowedZoneScope::InternetOnly) => "Inbound Allow (Internet Only)",
+            (RuleAction::Block, _) => "Inbound Block",
+        };
+
+        let msg = format!(
+            "{}: {} (:{} {})",
+            action_str, target.process_name, target.port, target.protocol
+        );
+        self.apply_rule_internal(rule, &msg);
+    }
+
+    pub fn get_or_load_metadata(
+        &mut self,
+        app_path: &str,
+    ) -> crate::core::process::ProcessMetadata {
+        if let Some(meta) = self.metadata_cache.get(app_path) {
+            return meta.clone();
+        }
+        let meta = crate::core::process::query_process_metadata(app_path);
+        self.metadata_cache
+            .insert(app_path.to_string(), meta.clone());
+        meta
+    }
+
+    pub fn set_watcher(&mut self, watcher: crate::core::watcher::FirewallRegistryWatcher) {
+        self.watcher = Some(watcher);
+    }
+
     fn apply_rule_internal(&mut self, rule: AppRule, success_text: &str) {
         if !self.require_admin(success_text) {
             return;
         }
 
+        if let Some(ref w) = self.watcher {
+            w.mark_self_mutation();
+        }
+
         let key = rule.app_path.to_lowercase();
+        let app_key = crate::core::rules::make_app_key(
+            &rule.app_path,
+            rule.service_name.as_deref(),
+            rule.direction,
+        );
         let filename = rule
             .app_path
             .rsplit(['\\', '/'])
@@ -704,7 +1235,9 @@ impl App {
             };
             match mgr.apply_rule(&params) {
                 Ok(_) => {
-                    self.verified_fw_rules.insert(key.clone(), params.name);
+                    self.verified_fw_rules
+                        .insert(key.clone(), params.name.clone());
+                    self.verified_fw_rules.insert(app_key.clone(), params.name);
                     self.set_status(format!("ENFORCED: {} (Windows Firewall)", success_text));
                 }
                 Err(e) => {
@@ -717,11 +1250,23 @@ impl App {
         #[cfg(not(windows))]
         {
             let params = FirewallRuleParams::from_app_rule(&rule);
-            self.verified_fw_rules.insert(key.clone(), params.name);
+            self.verified_fw_rules
+                .insert(key.clone(), params.name.clone());
+            self.verified_fw_rules.insert(app_key.clone(), params.name);
             self.set_status(format!("ENFORCED: {}", success_text));
         }
 
         // Оновлюємо стан в агрегаторі тільки після успішного застосування правила у фаерволі ОС
+        if let Some(app_item) = self.aggregator.apps.get_mut(&app_key) {
+            match rule.action {
+                RuleAction::Allow => {
+                    app_item.is_knocking = false;
+                }
+                RuleAction::Block => {
+                    app_item.is_knocking = true;
+                }
+            }
+        }
         if let Some(app_item) = self.aggregator.apps.get_mut(&key) {
             match rule.action {
                 RuleAction::Allow => {
@@ -736,19 +1281,22 @@ impl App {
         match rule.action {
             RuleAction::Allow => {
                 self.aggregator.blocked_paths_or_names.remove(&key);
+                self.aggregator.blocked_paths_or_names.remove(&app_key);
                 if !filename.is_empty() {
                     self.aggregator.blocked_paths_or_names.remove(&filename);
                 }
             }
             RuleAction::Block => {
                 self.aggregator.blocked_paths_or_names.insert(key.clone());
+                self.aggregator.blocked_paths_or_names.insert(app_key.clone());
                 if !filename.is_empty() {
                     self.aggregator.blocked_paths_or_names.insert(filename);
                 }
             }
         }
 
-        self.active_rules.insert(key, rule);
+        self.active_rules.insert(key, rule.clone());
+        self.active_rules.insert(app_key, rule);
         self.sync_selection();
     }
 }
@@ -1214,5 +1762,79 @@ mod tests {
         assert_eq!(app.edit_remote_ip, Some("93.184.216.34".into()));
         assert_eq!(app.edit_ports, "8443");
         assert_eq!(app.edit_protocol, "TCP");
+    }
+
+    #[test]
+    fn test_interactive_rule_editor_navigation_editing_and_validation() {
+        let mut app = App::new_with_privilege(true);
+        app.open_rule_editor_for_app(r"C:\App\curl.exe");
+        assert!(app.edit_mode);
+        assert_eq!(app.edit_focused_field, RuleEditorField::Action);
+
+        // Toggle Action Allow -> Block
+        app.editor_cycle_option(true);
+        assert_eq!(app.edit_action, RuleAction::Block);
+
+        // Navigate to Ports and enter invalid port
+        app.edit_focused_field = RuleEditorField::Ports;
+        app.edit_ports = "99999".into();
+        assert!(
+            !app.save_prefilled_rule(),
+            "Invalid port must fail validation and keep editor open"
+        );
+        assert!(app.edit_mode);
+        assert!(app.edit_error.is_some());
+
+        // Enter valid port range and save
+        app.edit_ports = "443,8080-8090".into();
+        assert!(app.save_prefilled_rule());
+        assert!(!app.edit_mode);
+        let saved = app.rule_for_app(r"C:\App\curl.exe").expect("rule must be saved");
+        assert_eq!(saved.action, RuleAction::Block);
+        assert_eq!(saved.ports, "443,8080-8090");
+    }
+
+    #[test]
+    fn test_quick_rule_reset_int_only_unseen_knocking_pause_and_lockdown() {
+        let mut app = App::new_with_privilege(true);
+        let path = r"C:\App\test.exe";
+        app.allow_selected_internet_only(path);
+        assert_eq!(
+            app.rule_for_app(path).map(|r| r.zone_scope),
+            Some(AllowedZoneScope::InternetOnly)
+        );
+
+        // Reset rule via [x] / [Delete]
+        app.reset_selected_rule(path);
+        assert!(app.rule_for_app(path).is_none());
+
+        // Switch to Allowed tab and record a knocking event -> unseen_knocking increments
+        app.set_filter(ViewFilter::AllowedOnly, "Allowed");
+        app.record_incoming_event(NetworkEvent {
+            timestamp: 100,
+            app_path: path.into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Outbound,
+            process_id: 99,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("1.1.1.1").unwrap(),
+            remote_port: 443,
+            protocol: "TCP".into(),
+            is_blocked: true,
+            zone: Zone::Internet,
+        });
+        assert_eq!(app.unseen_knocking_count(), 1);
+        app.set_filter(ViewFilter::KnockingOnly, "Knocking");
+        assert_eq!(
+            app.unseen_knocking_count(),
+            0,
+            "Switching to Knocking tab must clear unseen badge"
+        );
+
+        // Stream pause & Lockdown
+        app.toggle_stream_pause();
+        assert!(app.stream_paused);
+        app.toggle_lockdown();
+        assert!(app.lockdown_active);
     }
 }
