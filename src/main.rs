@@ -14,7 +14,27 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 
+const APP_VERSION: &str = env!("ITSFW_VERSION");
+
+fn format_cli_flag_output(arg: &str) -> Option<String> {
+    match arg {
+        "-V" | "--version" => Some(format!("it's.fw {}", APP_VERSION)),
+        "-h" | "--help" => Some(format!(
+            "it's.fw {}\nInteractive Windows Filtering Platform & Zero-Trust Firewall TUI\n\nUSAGE:\n    itsfw [OPTIONS]\n\nOPTIONS:\n    -V, --version    Print version information\n    -h, --help       Print help information",
+            APP_VERSION
+        )),
+        _ => None,
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    for arg in std::env::args().skip(1) {
+        if let Some(out) = format_cli_flag_output(&arg) {
+            println!("{}", out);
+            return Ok(());
+        }
+    }
+
     let is_admin = is_running_as_admin();
 
     // Встановлюємо Panic Hook, щоб при будь-якій аварії термінал гарантовано відновлювався!
@@ -428,4 +448,26 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_cli_flag_output_version_and_help() {
+        let ver_short = format_cli_flag_output("-V").expect("should return version");
+        let ver_long = format_cli_flag_output("--version").expect("should return version");
+        assert_eq!(ver_short, ver_long);
+        assert!(ver_short.starts_with("it's.fw "));
+        assert!(!APP_VERSION.is_empty());
+
+        let help_short = format_cli_flag_output("-h").expect("should return help");
+        let help_long = format_cli_flag_output("--help").expect("should return help");
+        assert_eq!(help_short, help_long);
+        assert!(help_short.contains("USAGE:"));
+        assert!(help_short.contains("--version"));
+
+        assert!(format_cli_flag_output("--unknown").is_none());
+    }
 }

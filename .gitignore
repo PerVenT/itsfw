@@ -20,6 +20,7 @@
 !/.gitignore
 !/Cargo.toml
 !/Cargo.lock
+!/build.rs
 !/Dockerfile
 !/Makefile
 !/README.md

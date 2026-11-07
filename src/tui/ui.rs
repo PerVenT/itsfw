@@ -141,7 +141,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let header_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(palette.border));
+        .border_style(Style::default().fg(palette.border))
+        .title_top(
+            Line::from(Span::styled(
+                format!(" {} ", env!("ITSFW_VERSION")),
+                Style::default().fg(palette.fg_muted),
+            ))
+            .right_aligned(),
+        );
     let paragraph = Paragraph::new(Line::from(title_spans)).block(header_block);
     f.render_widget(paragraph, area);
 }

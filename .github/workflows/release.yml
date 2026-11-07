@@ -16,6 +16,7 @@ permissions:
 
 env:
   RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.1.0' }}
+  ITSFW_BUILD_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag_name || 'v0.1.0' }}
 
 jobs:
   build:

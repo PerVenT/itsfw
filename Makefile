@@ -22,6 +22,7 @@ BUILDX_CMD := $(shell if $(DOCKER) buildx version >/dev/null 2>&1; then echo "$(
 
 # Container runner wrapper with named cargo cache volumes
 RUN_IN_CONTAINER = $(DOCKER) run --rm \
+	-e ITSFW_BUILD_VERSION="$(VERSION)" \
 	-v cargo-cache:/usr/local/cargo/registry:Z \
 	-v cargo-git:/usr/local/cargo/git:Z \
 	-v "$$(pwd):/workspace:Z" \
