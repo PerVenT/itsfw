@@ -264,6 +264,13 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                     .fg(palette.fg_muted)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::raw(" "),
+            Span::styled(
+                fit_width("SPEED / VOL", 12),
+                Style::default()
+                    .fg(palette.fg_muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]);
         f.render_widget(Paragraph::new(table_header), table_layout[0]);
 
@@ -363,6 +370,11 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                             fit_width(&format!("{}", item.total_hits), 6),
                             Style::default().fg(palette.internet_cyan),
                         ),
+                        Span::raw(" "),
+                        Span::styled(
+                            fit_width(&item.traffic_transfer_display(), 12),
+                            Style::default().fg(palette.fg_muted),
+                        ),
                     ]);
 
                     let item_style = if is_selected {
@@ -384,7 +396,10 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
     let palette = app.current_palette();
-    let filtered_apps = app.visible_apps();
+    let selected_app = app
+        .visible_apps()
+        .get(app.selected_index)
+        .map(|s| (*s).clone());
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -402,7 +417,7 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
         ))
         .border_style(Style::default().fg(palette.border));
 
-    if let Some(selected_app) = filtered_apps.get(app.selected_index) {
+    if let Some(selected_app) = selected_app {
         let parent_display = match &selected_app.parent_process_name {
             Some(p) => format!("{} (PID: {})", p, selected_app.process_id),
             None => {
@@ -414,8 +429,9 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             }
         };
 
-        let configured_rule = app.rule_for_app_entry(selected_app);
+        let configured_rule = app.rule_for_app_entry(&selected_app).cloned();
         let is_explicit_block_rule = configured_rule
+            .as_ref()
             .map(|r| r.action == crate::core::rules::RuleAction::Block)
             .unwrap_or(false);
 
@@ -426,7 +442,7 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
                 "KNOCKING (Packets Dropped by Firewall)",
                 palette.warning_orange,
             )
-        } else if let Some(rule) = configured_rule {
+        } else if let Some(ref rule) = configured_rule {
             match (rule.action, rule.zone_scope) {
                 (
                     crate::core::rules::RuleAction::Allow,
@@ -486,7 +502,8 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             )
         };
 
-        let meta = app.get_or_load_metadata(&selected_app.app_path);
+        let meta =
+            app.get_or_load_metadata_with_pid(&selected_app.app_path, selected_app.process_id);
         let desc_display = meta.description.as_deref().unwrap_or("-");
         let sign_badge = meta.signature.badge();
         let sign_color = match meta.signature {
@@ -515,7 +532,20 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             ));
         }
 
-        let policy_spans = if let Some(ref svc) = selected_app.service_name {
+        let cmd_str = meta
+            .command_line
+            .as_deref()
+            .unwrap_or(&selected_app.app_path);
+        let cmd_spans = vec![
+            Span::styled("Cmd: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                fit_width(cmd_str, cols[0].width.saturating_sub(7) as usize),
+                Style::default().fg(palette.fg),
+            ),
+        ];
+
+        let now_ts = crate::core::monitor::current_timestamp_secs() as i64;
+        let mut policy_spans = if let Some(ref svc) = selected_app.service_name {
             vec![
                 Span::styled("Service: ", Style::default().fg(palette.fg_muted)),
                 Span::styled(
@@ -540,6 +570,42 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             ]
         };
 
+        if let Some(ref rule) = configured_rule {
+            if let Some(rem) = rule.remaining_display(now_ts) {
+                policy_spans.push(Span::styled(
+                    format!(" ({})", rem),
+                    Style::default()
+                        .fg(palette.lan_yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+
+        let zone_str = selected_app.zones_display();
+        let zone_color = match zone_str {
+            "LAN+INET" => palette.allowed_green,
+            "INET" => palette.internet_cyan,
+            "LAN" => palette.lan_yellow,
+            _ => palette.fg_muted,
+        };
+
+        let zone_traffic_spans = vec![
+            Span::styled("Zone: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                zone_str,
+                Style::default().fg(zone_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  │  ↓ {} ↑ {} ({})",
+                    crate::core::monitor::format_bytes(selected_app.total_rx_bytes),
+                    crate::core::monitor::format_bytes(selected_app.total_tx_bytes),
+                    crate::core::monitor::format_speed(selected_app.current_speed_bytes_per_sec),
+                ),
+                Style::default().fg(palette.fg_muted),
+            ),
+        ];
+
         let detail_lines = vec![
             Line::from(vec![
                 Span::styled("App: ", Style::default().fg(palette.fg_muted)),
@@ -561,7 +627,9 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(&selected_app.app_path, Style::default().fg(palette.fg)),
             ]),
             Line::from(desc_sign_spans),
+            Line::from(cmd_spans),
             Line::from(policy_spans),
+            Line::from(zone_traffic_spans),
             Line::from(vec![
                 Span::styled("Win Firewall: ", Style::default().fg(palette.fg_muted)),
                 Span::styled(
@@ -1109,7 +1177,7 @@ fn render_edit_modal(f: &mut Frame, app: &App) {
     let area = f.area();
 
     let width = 76.min(area.width.saturating_sub(4));
-    let height = 15.min(area.height.saturating_sub(2));
+    let height = 16.min(area.height.saturating_sub(2));
     let popup_area = Rect {
         x: (area.width.saturating_sub(width)) / 2,
         y: (area.height.saturating_sub(height)) / 2,
@@ -1154,7 +1222,7 @@ fn render_edit_modal(f: &mut Frame, app: &App) {
         }
     };
 
-    use crate::core::rules::{AllowedZoneScope, RuleAction, RuleDirection};
+    use crate::core::rules::{AllowedZoneScope, RuleAction, RuleDirection, RuleDuration};
     let mut lines = Vec::new();
 
     // App path line
@@ -1192,6 +1260,34 @@ fn render_edit_modal(f: &mut Frame, app: &App) {
         Span::styled(
             "[Inbound]",
             opt_style(app.edit_direction == RuleDirection::Inbound),
+        ),
+    ]));
+
+    // Duration field
+    let (cur, cur_style) = focus_cursor(RuleEditorField::Duration);
+    lines.push(Line::from(vec![
+        Span::styled(cur, cur_style),
+        Span::styled("Duration:    ", Style::default().fg(palette.fg)),
+        Span::styled(
+            "[Permanent]",
+            opt_style(app.edit_duration == RuleDuration::Permanent),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "[5m]",
+            opt_style(app.edit_duration == RuleDuration::Minutes5),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "[15m]",
+            opt_style(app.edit_duration == RuleDuration::Minutes15),
+        ),
+        Span::raw(" "),
+        Span::styled("[1h]", opt_style(app.edit_duration == RuleDuration::Hour1)),
+        Span::raw(" "),
+        Span::styled(
+            "[Until Exit]",
+            opt_style(app.edit_duration == RuleDuration::UntilExit),
         ),
     ]));
 
@@ -1481,6 +1577,8 @@ mod tests {
                 ports: "53".into(),
                 interface_name: None,
                 created_at: 0,
+                duration: crate::core::rules::RuleDuration::Permanent,
+                expires_at: None,
             },
         );
 
@@ -1491,11 +1589,13 @@ mod tests {
         assert!(out.contains("APPLICATION"));
         assert!(out.contains("STATUS"));
         assert!(out.contains("TRAFFIC"));
+        assert!(out.contains("SPEED / VOL"));
 
         // App row and inspector fields
         assert!(out.contains("svchost.exe"));
         assert!(out.contains("Process Details"));
         assert!(out.contains("services.exe (PID: 1024)"));
+        assert!(out.contains("Cmd:"));
         assert!(out.contains("LAN ONLY (Explicit Rule)"));
         assert!(out.contains("Recent Activity"));
     }
@@ -1542,6 +1642,7 @@ mod tests {
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let out_edit = buffer_to_string(terminal.backend().buffer());
         assert!(out_edit.contains("Custom Rule Editor"));
+        assert!(out_edit.contains("Duration:"));
         assert!(out_edit.contains("Specify ports"));
     }
 

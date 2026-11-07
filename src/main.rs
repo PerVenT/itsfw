@@ -41,8 +41,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::panic::set_hook(Box::new(|info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        crate::core::etw::EtwNetworkMonitor::stop_session();
+        let _ = crate::core::firewall::WindowsFirewallManager::remove_all_temporary_rules();
         eprintln!("\n[it's.fw PANIC]: {:?}", info);
     }));
+
+    if is_admin {
+        let _ = crate::core::firewall::WindowsFirewallManager::remove_all_temporary_rules();
+    }
+
+    let etw_monitor = crate::core::etw::EtwNetworkMonitor::start();
 
     // Ініціалізація терміналу
     enable_raw_mode()?;
@@ -82,12 +90,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.sync_selection();
 
     // Запуск головного циклу подій TUI
-    let res = run_app(&mut terminal, &mut app, &mut wfp_monitor, &watcher);
+    let res = run_app(
+        &mut terminal,
+        &mut app,
+        &mut wfp_monitor,
+        &watcher,
+        &etw_monitor,
+    );
 
     // Відновлення терміналу
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+
+    crate::core::etw::EtwNetworkMonitor::stop_session();
+    if is_admin {
+        let _ = crate::core::firewall::WindowsFirewallManager::remove_all_temporary_rules();
+    }
 
     if let Err(err) = res {
         eprintln!("Application error: {:?}", err);
@@ -101,6 +120,7 @@ fn run_app<B: ratatui::backend::Backend>(
     app: &mut App,
     wfp_monitor: &mut WfpDropMonitor,
     watcher: &crate::core::watcher::FirewallRegistryWatcher,
+    etw_monitor: &crate::core::etw::EtwNetworkMonitor,
 ) -> io::Result<()>
 where
     io::Error: From<B::Error>,
@@ -108,6 +128,10 @@ where
     let mut last_scan = std::time::Instant::now();
 
     loop {
+        // Перевірка та автоматичне видалення протермінованих тимчасових правил
+        let now_ts = crate::core::monitor::current_timestamp_secs() as i64;
+        let _ = app.tick_expired_rules(now_ts);
+
         // Фонова перевірка зовнішніх змін у реєстрі Windows Firewall
         if let Some(crate::core::watcher::FirewallWatchEvent::ExternalChangeDetected) =
             watcher.try_recv()
@@ -124,9 +148,14 @@ where
             app.set_status("Synced external firewall changes".into());
         }
 
-        // Періодичне фонове підсканування активних з'єднань та WFP Drop подій кожні 2 секунди
+        // Періодичне фонове підсканування активних з'єднань, ETW трафіку та WFP Drop подій кожні 2 секунди
         if last_scan.elapsed() >= std::time::Duration::from_secs(2) {
+            let elapsed_secs = last_scan.elapsed().as_secs_f64();
             if !app.stream_paused {
+                let pid_deltas = etw_monitor.drain_pid_deltas();
+                app.aggregator
+                    .apply_bandwidth_deltas(&pid_deltas, elapsed_secs);
+
                 let events = scan_current_network_connections();
                 for ev in events {
                     app.record_incoming_event(ev);

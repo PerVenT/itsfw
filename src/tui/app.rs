@@ -75,6 +75,7 @@ impl SortMode {
 pub enum RuleEditorField {
     Action,      // [Allow | Block]
     Direction,   // [Outbound | Inbound]
+    Duration,    // [Permanent | 5m | 15m | 1h | Until Exit]
     ZoneScope,   // [All (LAN+Inet) | LAN Only | Internet Only | Custom IP/CIDR]
     CustomIp,    // Editable string when ZoneScope == CustomIp
     Protocol,    // [TCP | UDP | Any]
@@ -112,6 +113,7 @@ pub struct App {
     pub edit_focused_field: RuleEditorField,
     pub edit_action: RuleAction,
     pub edit_direction: RuleDirection,
+    pub edit_duration: crate::core::rules::RuleDuration,
     pub edit_zone_scope: AllowedZoneScope,
     pub edit_custom_ip_mode: bool,
     pub edit_custom_ip: String,
@@ -166,6 +168,7 @@ impl App {
             edit_focused_field: RuleEditorField::Action,
             edit_action: RuleAction::Allow,
             edit_direction: RuleDirection::Outbound,
+            edit_duration: crate::core::rules::RuleDuration::Permanent,
             edit_zone_scope: AllowedZoneScope::Both,
             edit_custom_ip_mode: false,
             edit_custom_ip: String::new(),
@@ -706,11 +709,13 @@ impl App {
                 NetProtocol::Udp => "UDP".into(),
                 NetProtocol::Any => "ANY".into(),
             };
+            self.edit_duration = existing.duration;
             self.edit_service_name = existing.service_name.clone().or_else(|| svc.clone());
             self.edit_apply_to_service = self.edit_service_name.is_some();
         } else {
             self.edit_action = RuleAction::Allow;
             self.edit_direction = active_rule_dir;
+            self.edit_duration = crate::core::rules::RuleDuration::Permanent;
             self.edit_zone_scope = AllowedZoneScope::Both;
             self.edit_custom_ip_mode = false;
             self.edit_custom_ip = String::new();
@@ -749,6 +754,7 @@ impl App {
         let mut fields = vec![
             RuleEditorField::Action,
             RuleEditorField::Direction,
+            RuleEditorField::Duration,
             RuleEditorField::ZoneScope,
         ];
         if self.edit_custom_ip_mode {
@@ -808,6 +814,21 @@ impl App {
                     RuleDirection::Outbound => RuleDirection::Inbound,
                     RuleDirection::Inbound => RuleDirection::Outbound,
                 };
+            }
+            RuleEditorField::Duration => {
+                let durations = crate::core::rules::RuleDuration::ALL;
+                let pos = durations
+                    .iter()
+                    .position(|d| *d == self.edit_duration)
+                    .unwrap_or(0);
+                let next_pos = if forward {
+                    (pos + 1) % durations.len()
+                } else if pos == 0 {
+                    durations.len() - 1
+                } else {
+                    pos - 1
+                };
+                self.edit_duration = durations[next_pos];
             }
             RuleEditorField::ZoneScope => {
                 let cur = if self.edit_custom_ip_mode {
@@ -948,6 +969,9 @@ impl App {
         self.edit_ports = validated_ports.clone();
         self.edit_error = None;
 
+        let now_ts = crate::core::monitor::current_timestamp_secs() as i64;
+        let expires_at = self.edit_duration.duration_secs().map(|s| now_ts + s);
+
         let rule = AppRule {
             app_path: self.edit_app_path.clone(),
             service_name: if self.edit_apply_to_service {
@@ -962,7 +986,9 @@ impl App {
             protocol: proto,
             ports: validated_ports,
             interface_name: None,
-            created_at: crate::core::monitor::current_timestamp_secs() as i64,
+            created_at: now_ts,
+            duration: self.edit_duration,
+            expires_at,
         };
 
         let msg = format!(
@@ -997,6 +1023,8 @@ impl App {
             ports: "*".into(),
             interface_name: None,
             created_at: crate::core::monitor::current_timestamp_secs() as i64,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
 
         self.apply_rule_internal(rule, msg);
@@ -1073,6 +1101,8 @@ impl App {
             ports: port.to_string(),
             interface_name: None,
             created_at: crate::core::monitor::current_timestamp_secs() as i64,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
 
         let msg = format!("Allowed: {}:{}", protocol_str, port);
@@ -1157,6 +1187,57 @@ impl App {
         self.sync_selection();
     }
 
+    pub fn tick_expired_rules(&mut self, now_ts: i64) -> Vec<String> {
+        let expired_keys: Vec<(String, String, Option<String>, RuleDirection)> = self
+            .active_rules
+            .iter()
+            .filter(|(_, r)| r.is_expired(now_ts))
+            .map(|(k, r)| {
+                (
+                    k.clone(),
+                    r.app_path.clone(),
+                    r.service_name.clone(),
+                    r.direction,
+                )
+            })
+            .collect();
+
+        if expired_keys.is_empty() {
+            return Vec::new();
+        }
+
+        let mut expired_names = Vec::new();
+        for (key, path, _svc, _dir) in expired_keys {
+            if let Some(ref w) = self.watcher {
+                w.mark_self_mutation();
+            }
+            #[cfg(windows)]
+            {
+                if !cfg!(test) {
+                    let _ = crate::core::firewall::WindowsFirewallManager::remove_app_rules(
+                        &path,
+                        _svc.as_deref(),
+                        _dir,
+                    );
+                }
+            }
+            self.active_rules.remove(&key);
+            self.active_rules.remove(&path.to_lowercase());
+            self.verified_fw_rules.remove(&key);
+            self.verified_fw_rules.remove(&path.to_lowercase());
+            if let Some(entry) = self.aggregator.apps.get_mut(&key) {
+                entry.is_knocking = false;
+            }
+            let name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+            expired_names.push(name);
+        }
+        self.sync_selection();
+        if let Some(first) = expired_names.first() {
+            self.set_status(format!("Expired temporary rule for {}", first));
+        }
+        expired_names
+    }
+
     pub fn toggle_stream_pause(&mut self) {
         self.stream_paused = !self.stream_paused;
         let msg = if self.stream_paused {
@@ -1238,6 +1319,8 @@ impl App {
             ports: target.port.to_string(),
             interface_name: None,
             created_at: crate::core::monitor::current_timestamp_secs() as i64,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
 
         let action_str = match (action, zone_scope) {
@@ -1531,6 +1614,8 @@ mod tests {
                 ports: "*".into(),
                 interface_name: None,
                 created_at: 100,
+                duration: crate::core::rules::RuleDuration::Permanent,
+                expires_at: None,
             },
         );
         app.sync_from_os_rules(os_rules);
@@ -2002,5 +2087,32 @@ mod tests {
         app.selected_index = 10;
         app.toggle_direction(); // switches to Outbound (which has 1 item: svchost)
         assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_temporary_rule_editor_and_auto_expiration() {
+        let mut app = App::new_with_privilege(true);
+        let path = r"C:\Tools\updater.exe";
+        app.open_rule_editor_for_app(path);
+        app.edit_focused_field = RuleEditorField::Duration;
+        app.editor_cycle_option(true); // Permanent -> Minutes5
+        assert_eq!(
+            app.edit_duration,
+            crate::core::rules::RuleDuration::Minutes5
+        );
+        assert!(app.save_prefilled_rule());
+
+        let rule = app.rule_for_app(path).expect("rule should be saved");
+        assert_eq!(rule.duration, crate::core::rules::RuleDuration::Minutes5);
+        let exp = rule.expires_at.expect("should have expires_at");
+
+        // Before expiration
+        assert!(app.tick_expired_rules(exp - 1).is_empty());
+        assert!(app.rule_for_app(path).is_some());
+
+        // At expiration
+        let expired = app.tick_expired_rules(exp);
+        assert_eq!(expired.len(), 1);
+        assert!(app.rule_for_app(path).is_none());
     }
 }
