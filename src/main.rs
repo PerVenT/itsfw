@@ -58,11 +58,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // 1. Завантажуємо чинні вихідні правила безпосередньо з Windows Firewall (Єдине Джерело Правди)
+    // 1. Завантажуємо чинні правила (Outbound + Inbound) безпосередньо з Windows Firewall (Єдине Джерело Правди)
     let active_its_fw_rules =
         crate::core::firewall::WindowsFirewallManager::load_active_its_fw_rules();
     app.verified_fw_rules = active_its_fw_rules;
-    let os_rules = crate::core::firewall::WindowsFirewallManager::load_outbound_rules_from_os();
+    let os_rules = crate::core::firewall::WindowsFirewallManager::load_all_rules_from_os();
     app.sync_from_os_rules(os_rules);
 
     // 2. Ініціалізуємо WFP Drop Monitor та Registry Watcher
@@ -112,18 +112,14 @@ where
         if let Some(crate::core::watcher::FirewallWatchEvent::ExternalChangeDetected) =
             watcher.try_recv()
         {
+            app.firewall_active =
+                crate::core::firewall::WindowsFirewallManager::is_outbound_policy_blocking();
+            app.inbound_firewall_active =
+                crate::core::firewall::WindowsFirewallManager::is_inbound_policy_blocking();
             let active_its_fw_rules =
                 crate::core::firewall::WindowsFirewallManager::load_active_its_fw_rules();
             app.verified_fw_rules = active_its_fw_rules;
-            let dir = match app.active_direction {
-                crate::tui::app::FirewallDirection::Outbound => {
-                    crate::core::rules::RuleDirection::Outbound
-                }
-                crate::tui::app::FirewallDirection::Inbound => {
-                    crate::core::rules::RuleDirection::Inbound
-                }
-            };
-            let os_rules = crate::core::firewall::WindowsFirewallManager::load_rules_from_os(dir);
+            let os_rules = crate::core::firewall::WindowsFirewallManager::load_all_rules_from_os();
             app.sync_from_os_rules(os_rules);
             app.set_status("Synced external firewall changes".into());
         }
@@ -397,20 +393,13 @@ where
                     }
                     KeyCode::Char('r') => {
                         app.firewall_active = crate::core::firewall::WindowsFirewallManager::is_outbound_policy_blocking();
+                        app.inbound_firewall_active = crate::core::firewall::WindowsFirewallManager::is_inbound_policy_blocking();
                         let active_its_fw_rules =
                             crate::core::firewall::WindowsFirewallManager::load_active_its_fw_rules(
                             );
                         app.verified_fw_rules = active_its_fw_rules;
-                        let dir = match app.active_direction {
-                            crate::tui::app::FirewallDirection::Outbound => {
-                                crate::core::rules::RuleDirection::Outbound
-                            }
-                            crate::tui::app::FirewallDirection::Inbound => {
-                                crate::core::rules::RuleDirection::Inbound
-                            }
-                        };
                         let os_rules =
-                            crate::core::firewall::WindowsFirewallManager::load_rules_from_os(dir);
+                            crate::core::firewall::WindowsFirewallManager::load_all_rules_from_os();
                         let count = os_rules.len();
                         app.sync_from_os_rules(os_rules);
                         for drop_ev in wfp_monitor.poll_dropped_events() {

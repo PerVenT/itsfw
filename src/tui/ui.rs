@@ -61,20 +61,41 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let palette = app.current_palette();
     let dir_label = app.active_direction.label();
 
-    let fw_status = if app.firewall_active {
-        Span::styled(
-            format!("● {}: BLOCK (Whitelist Mode)", dir_label),
-            Style::default()
-                .fg(palette.warning_orange)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            format!("● {}: ALLOW (Default Mode)", dir_label),
-            Style::default()
-                .fg(palette.allowed_green)
-                .add_modifier(Modifier::BOLD),
-        )
+    let fw_status = match app.active_direction {
+        crate::tui::app::FirewallDirection::Outbound => {
+            if app.firewall_active {
+                Span::styled(
+                    format!("● {}: BLOCK (Whitelist Mode)", dir_label),
+                    Style::default()
+                        .fg(palette.warning_orange)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    format!("● {}: ALLOW (Default Mode)", dir_label),
+                    Style::default()
+                        .fg(palette.allowed_green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
+        }
+        crate::tui::app::FirewallDirection::Inbound => {
+            if app.inbound_firewall_active {
+                Span::styled(
+                    format!("● {}: BLOCK (Default Mode)", dir_label),
+                    Style::default()
+                        .fg(palette.warning_orange)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    format!("● {}: ALLOW (Open Mode)", dir_label),
+                    Style::default()
+                        .fg(palette.allowed_green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
+        }
     };
 
     let mut title_spans = vec![Span::styled(
@@ -426,31 +447,44 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             ("ALLOW (Default Policy)", palette.fg_muted)
         };
 
+        let composite_key = crate::core::rules::make_app_key(
+            &selected_app.app_path,
+            selected_app.service_name.as_deref(),
+            selected_app.direction,
+        );
         let path_lower = selected_app.app_path.to_lowercase();
-        let (fw_sync_status, fw_sync_color) =
-            if let Some(rule_name) = app.verified_fw_rules.get(&path_lower) {
-                (format!("✓ ENFORCED ({})", rule_name), palette.allowed_green)
-            } else if is_explicit_block_rule {
-                (
-                    "● BLOCKED (Active Rule in Windows Firewall)".into(),
-                    palette.alert_red,
-                )
-            } else if selected_app.is_knocking {
-                (
-                    "▲ DROPPED (Blocked by Default Outbound / Zone Policy)".into(),
-                    palette.warning_orange,
-                )
-            } else if configured_rule.is_some() {
-                (
-                    "✓ ENFORCED (Active in Windows Firewall)".into(),
-                    palette.allowed_green,
-                )
+        let verified_rule_name = app.verified_fw_rules.get(&composite_key).or_else(|| {
+            if selected_app.direction == crate::core::rules::RuleDirection::Outbound
+                && selected_app.service_name.is_none()
+            {
+                app.verified_fw_rules.get(&path_lower)
             } else {
-                (
-                    "○ UNMANAGED (Standard Windows Policy)".into(),
-                    palette.fg_muted,
-                )
-            };
+                None
+            }
+        });
+        let (fw_sync_status, fw_sync_color) = if let Some(rule_name) = verified_rule_name {
+            (format!("✓ ENFORCED ({})", rule_name), palette.allowed_green)
+        } else if is_explicit_block_rule {
+            (
+                "● BLOCKED (Active Rule in Windows Firewall)".into(),
+                palette.alert_red,
+            )
+        } else if selected_app.is_knocking {
+            (
+                "▲ DROPPED (Blocked by Default Outbound / Zone Policy)".into(),
+                palette.warning_orange,
+            )
+        } else if configured_rule.is_some() {
+            (
+                "✓ ENFORCED (Active in Windows Firewall)".into(),
+                palette.allowed_green,
+            )
+        } else {
+            (
+                "○ UNMANAGED (Standard Windows Policy)".into(),
+                palette.fg_muted,
+            )
+        };
 
         let meta = app.get_or_load_metadata(&selected_app.app_path);
         let desc_display = meta.description.as_deref().unwrap_or("-");
@@ -1394,6 +1428,14 @@ mod tests {
         assert!(out.contains("Outbound: BLOCK"));
         assert!(out.contains("[READ-ONLY: NO ADMIN]"));
         assert!(out.contains("Denial Notice"));
+
+        // 3. Switching direction to Inbound shows Inbound default policy (BLOCK) independently of Outbound
+        app.firewall_active = false;
+        app.inbound_firewall_active = true;
+        app.toggle_direction();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let out_in = buffer_to_string(terminal.backend().buffer());
+        assert!(out_in.contains("Inbound: BLOCK (Default Mode)"));
     }
 
     #[test]

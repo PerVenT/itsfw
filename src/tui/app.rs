@@ -86,6 +86,7 @@ pub struct App {
     pub should_quit: bool,
     pub is_admin: bool,
     pub firewall_active: bool,
+    pub inbound_firewall_active: bool,
     pub current_filter: ViewFilter,
     pub sort_mode: SortMode,
     pub sort_menu_open: bool,
@@ -138,6 +139,8 @@ impl App {
             is_admin,
             firewall_active:
                 crate::core::firewall::WindowsFirewallManager::is_outbound_policy_blocking(),
+            inbound_firewall_active:
+                crate::core::firewall::WindowsFirewallManager::is_inbound_policy_blocking(),
             current_filter: ViewFilter::All,
             sort_mode: SortMode::NameAsc,
             sort_menu_open: false,
@@ -355,9 +358,11 @@ impl App {
             item.service_name.as_deref(),
             item.direction,
         );
-        self.active_rules
-            .get(&key)
-            .or_else(|| self.active_rules.get(&item.app_path.to_lowercase()))
+        self.active_rules.get(&key).or_else(|| {
+            self.active_rules
+                .get(&item.app_path.to_lowercase())
+                .filter(|r| r.direction == item.direction)
+        })
     }
 
     /// Повертає активне правило Windows Firewall для заданого шляху додатку (регістронезалежно).
@@ -370,7 +375,7 @@ impl App {
         self.active_rules.get(&app_key).or_else(|| {
             self.active_rules
                 .get(&app_path.to_lowercase())
-                .filter(|r| r.service_name.is_none())
+                .filter(|r| r.service_name.is_none() && r.direction == dir)
         })
     }
 
@@ -595,27 +600,59 @@ impl App {
         if !self.require_admin("Toggle Firewall Policy") {
             return;
         }
-        let target_state = !self.firewall_active;
-        #[cfg(windows)]
-        {
-            match crate::core::firewall::WindowsFirewallManager::set_outbound_policy(target_state) {
-                Ok(_) => {
-                    self.firewall_active = target_state;
-                    let status_str = if self.firewall_active {
-                        "Firewall: ACTIVE (Blocking Outbound)"
-                    } else {
-                        "Firewall: INACTIVE (Allow Outbound)"
-                    };
-                    self.set_status(status_str.into());
+        match self.active_direction {
+            FirewallDirection::Outbound => {
+                let target_state = !self.firewall_active;
+                #[cfg(windows)]
+                {
+                    match crate::core::firewall::WindowsFirewallManager::set_outbound_policy(
+                        target_state,
+                    ) {
+                        Ok(_) => {
+                            self.firewall_active = target_state;
+                            let status_str = if self.firewall_active {
+                                "Firewall: ACTIVE (Blocking Outbound)"
+                            } else {
+                                "Firewall: INACTIVE (Allow Outbound)"
+                            };
+                            self.set_status(status_str.into());
+                        }
+                        Err(e) => {
+                            self.set_status(format!("ERROR: Failed to change policy: {}", e));
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.set_status(format!("ERROR: Failed to change policy: {}", e));
+                #[cfg(not(windows))]
+                {
+                    self.firewall_active = target_state;
                 }
             }
-        }
-        #[cfg(not(windows))]
-        {
-            self.firewall_active = target_state;
+            FirewallDirection::Inbound => {
+                let target_state = !self.inbound_firewall_active;
+                #[cfg(windows)]
+                {
+                    match crate::core::firewall::WindowsFirewallManager::set_inbound_policy(
+                        target_state,
+                    ) {
+                        Ok(_) => {
+                            self.inbound_firewall_active = target_state;
+                            let status_str = if self.inbound_firewall_active {
+                                "Firewall: ACTIVE (Blocking Inbound)"
+                            } else {
+                                "Firewall: OPEN (Allow Inbound)"
+                            };
+                            self.set_status(status_str.into());
+                        }
+                        Err(e) => {
+                            self.set_status(format!("ERROR: Failed to change policy: {}", e));
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    self.inbound_firewall_active = target_state;
+                }
+            }
         }
     }
 
@@ -649,7 +686,11 @@ impl App {
         let existing = self
             .active_rules
             .get(&app_key)
-            .or_else(|| self.active_rules.get(&app_path.to_lowercase()))
+            .or_else(|| {
+                self.active_rules
+                    .get(&app_path.to_lowercase())
+                    .filter(|r| r.direction == active_rule_dir)
+            })
             .cloned();
 
         if let Some(existing) = existing {

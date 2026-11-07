@@ -167,6 +167,22 @@ pub fn parse_netsh_profiles_outbound_blocked(text: &str) -> bool {
     false
 }
 
+/// Парсить вивід `netsh advfirewall show allprofiles` та визначає, чи увімкнено блокування вхідного трафіку за замовчуванням (`BlockInbound`).
+pub fn parse_netsh_profiles_inbound_blocked(text: &str) -> bool {
+    let mut found_policy_line = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Firewall Policy") {
+            found_policy_line = true;
+            let lower = trimmed.to_lowercase();
+            if lower.contains("blockinbound") {
+                return true;
+            }
+        }
+    }
+    !found_policy_line
+}
+
 /// Парсить вивід `netsh advfirewall firewall show rule name=all dir=out verbose`
 /// та реконструює актуальні правила для додатків (Єдине Джерело Правди з Windows Firewall).
 /// Парсить вивід `netsh advfirewall firewall show rule` для вказаного напрямку (`RuleDirection`).
@@ -477,6 +493,8 @@ static LOCKDOWN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 pub trait FirewallBackend: Send + Sync {
     fn is_outbound_blocking(&self) -> bool;
     fn set_outbound_blocking(&self, block: bool) -> anyhow::Result<()>;
+    fn is_inbound_blocking(&self) -> bool;
+    fn set_inbound_blocking(&self, block: bool) -> anyhow::Result<()>;
     fn is_lockdown_active(&self) -> bool;
     fn set_lockdown(&self, active: bool) -> anyhow::Result<()>;
     fn load_rules(&self, direction: RuleDirection) -> std::collections::HashMap<String, AppRule>;
@@ -657,6 +675,39 @@ impl FirewallBackend for ComFirewallBackend {
             policy.put_DefaultOutboundAction(NET_FW_PROFILE2_DOMAIN, action)?;
             policy.put_DefaultOutboundAction(NET_FW_PROFILE2_PRIVATE, action)?;
             policy.put_DefaultOutboundAction(NET_FW_PROFILE2_PUBLIC, action)?;
+        }
+        Ok(())
+    }
+
+    fn is_inbound_blocking(&self) -> bool {
+        use windows::Win32::NetworkManagement::WindowsFirewall::{
+            NET_FW_ACTION_BLOCK, NET_FW_PROFILE2_PUBLIC,
+        };
+        if let Ok(policy) = self.policy() {
+            unsafe {
+                if let Ok(action) = policy.get_DefaultInboundAction(NET_FW_PROFILE2_PUBLIC) {
+                    return action == NET_FW_ACTION_BLOCK;
+                }
+            }
+        }
+        true
+    }
+
+    fn set_inbound_blocking(&self, block: bool) -> anyhow::Result<()> {
+        use windows::Win32::NetworkManagement::WindowsFirewall::{
+            NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK, NET_FW_PROFILE2_DOMAIN,
+            NET_FW_PROFILE2_PRIVATE, NET_FW_PROFILE2_PUBLIC,
+        };
+        let policy = self.policy()?;
+        let action = if block {
+            NET_FW_ACTION_BLOCK
+        } else {
+            NET_FW_ACTION_ALLOW
+        };
+        unsafe {
+            policy.put_DefaultInboundAction(NET_FW_PROFILE2_DOMAIN, action)?;
+            policy.put_DefaultInboundAction(NET_FW_PROFILE2_PRIVATE, action)?;
+            policy.put_DefaultInboundAction(NET_FW_PROFILE2_PUBLIC, action)?;
         }
         Ok(())
     }
@@ -1057,6 +1108,12 @@ impl FirewallBackend for ComFirewallBackend {
     fn set_outbound_blocking(&self, _block: bool) -> anyhow::Result<()> {
         Ok(())
     }
+    fn is_inbound_blocking(&self) -> bool {
+        true
+    }
+    fn set_inbound_blocking(&self, _block: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn is_lockdown_active(&self) -> bool {
         false
     }
@@ -1117,6 +1174,31 @@ impl WindowsFirewallManager<SystemCommandRunner> {
         Self::is_outbound_policy_blocking_with(&SystemCommandRunner)
     }
 
+    pub fn is_inbound_policy_blocking() -> bool {
+        #[cfg(windows)]
+        {
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.is_inbound_blocking();
+                }
+            }
+        }
+        Self::is_inbound_policy_blocking_with(&SystemCommandRunner)
+    }
+
+    pub fn set_inbound_policy(block: bool) -> anyhow::Result<()> {
+        let _ = block;
+        #[cfg(windows)]
+        {
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.set_inbound_blocking(block);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_lockdown_active() -> bool {
         #[cfg(windows)]
         {
@@ -1158,6 +1240,12 @@ impl WindowsFirewallManager<SystemCommandRunner> {
 
     pub fn load_outbound_rules_from_os() -> std::collections::HashMap<String, AppRule> {
         Self::load_rules_from_os(RuleDirection::Outbound)
+    }
+
+    pub fn load_all_rules_from_os() -> std::collections::HashMap<String, AppRule> {
+        let mut all = Self::load_rules_from_os(RuleDirection::Outbound);
+        all.extend(Self::load_rules_from_os(RuleDirection::Inbound));
+        all
     }
 
     pub fn load_blocked_outbound_apps() -> std::collections::HashSet<String> {
@@ -1219,6 +1307,14 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
             parse_netsh_profiles_outbound_blocked(&out.stdout)
         } else {
             false
+        }
+    }
+
+    pub fn is_inbound_policy_blocking_with(runner: &R) -> bool {
+        if let Ok(out) = runner.execute(&["advfirewall", "show", "allprofiles"]) {
+            parse_netsh_profiles_inbound_blocked(&out.stdout)
+        } else {
+            true
         }
     }
 
