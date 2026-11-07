@@ -1172,8 +1172,11 @@ mod tests {
             app_path.to_lowercase(),
             AppRule {
                 app_path: app_path.into(),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Outbound,
                 action: RuleAction::Allow,
                 zone_scope: AllowedZoneScope::LanOnly,
+                custom_remote_ip: None,
                 protocol: NetProtocol::Udp,
                 ports: "53".into(),
                 interface_name: None,

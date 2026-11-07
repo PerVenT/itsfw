@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum RuleDirection {
+    #[default]
+    Outbound,
+    Inbound,
+}
+
+impl RuleDirection {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RuleDirection::Outbound => "Outbound",
+            RuleDirection::Inbound => "Inbound",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleAction {
     Allow,
@@ -23,12 +39,150 @@ pub enum NetProtocol {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRule {
     pub app_path: String,
+    #[serde(default)]
+    pub service_name: Option<String>,
+    #[serde(default)]
+    pub direction: RuleDirection,
     pub action: RuleAction,
     pub zone_scope: AllowedZoneScope,
+    #[serde(default)]
+    pub custom_remote_ip: Option<String>,
     pub protocol: NetProtocol,
     pub ports: String, // наприклад "80,443" або "*"
     pub interface_name: Option<String>,
     pub created_at: i64,
+}
+
+impl AppRule {
+    pub fn composite_key(&self) -> String {
+        make_app_key(&self.app_path, self.service_name.as_deref(), self.direction)
+    }
+}
+
+pub fn make_app_key(app_path: &str, service_name: Option<&str>, direction: RuleDirection) -> String {
+    let lower_path = app_path.to_lowercase();
+    let base_key = match service_name {
+        Some(svc) if !svc.trim().is_empty() => {
+            format!("{}::svc:{}", lower_path, svc.trim().to_lowercase())
+        }
+        _ => lower_path,
+    };
+    match direction {
+        RuleDirection::Outbound => base_key,
+        RuleDirection::Inbound => format!("in::{}", base_key),
+    }
+}
+
+pub fn validate_ports_spec(spec: &str, protocol: NetProtocol) -> Result<String, String> {
+    if protocol == NetProtocol::Any {
+        return Ok("*".into());
+    }
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err("Port specification cannot be empty".into());
+    }
+    if trimmed == "*" || trimmed.eq_ignore_ascii_case("any") {
+        return Ok("*".into());
+    }
+
+    let tokens: Vec<&str> = trimmed.split(',').map(|s| s.trim()).collect();
+    if tokens.is_empty() {
+        return Err("Port specification cannot be empty".into());
+    }
+
+    let mut validated_tokens = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if token.is_empty() {
+            return Err("Empty port entry in list".into());
+        }
+        if token.contains('-') {
+            let parts: Vec<&str> = token.split('-').map(|s| s.trim()).collect();
+            if parts.len() != 2 {
+                return Err(format!("Invalid port range format: '{}'", token));
+            }
+            let start = parts[0]
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid range start port: '{}'", parts[0]))?;
+            let end = parts[1]
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid range end port: '{}'", parts[1]))?;
+            if start == 0 {
+                return Err("Port number cannot be 0".into());
+            }
+            if start > end {
+                return Err(format!(
+                    "Invalid port range: start ({}) cannot be greater than end ({})",
+                    start, end
+                ));
+            }
+            validated_tokens.push(format!("{}-{}", start, end));
+        } else {
+            let port = token
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid port number: '{}'", token))?;
+            if port == 0 {
+                return Err("Port number cannot be 0".into());
+            }
+            validated_tokens.push(port.to_string());
+        }
+    }
+
+    Ok(validated_tokens.join(","))
+}
+
+pub fn validate_ip_or_cidr_spec(spec: &str) -> Result<String, String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err("IP / CIDR specification cannot be empty".into());
+    }
+    if trimmed == "*" || trimmed.eq_ignore_ascii_case("any") {
+        return Ok("any".into());
+    }
+
+    let tokens: Vec<&str> = trimmed.split(',').map(|s| s.trim()).collect();
+    if tokens.is_empty() {
+        return Err("IP / CIDR specification cannot be empty".into());
+    }
+
+    let mut validated_tokens = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if token.is_empty() {
+            return Err("Empty IP entry in list".into());
+        }
+        if token.contains('/') {
+            let parts: Vec<&str> = token.split('/').map(|s| s.trim()).collect();
+            if parts.len() != 2 {
+                return Err(format!("Invalid CIDR format: '{}'", token));
+            }
+            let ip = parts[0]
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| format!("Invalid IP address in CIDR: '{}'", parts[0]))?;
+            let prefix = parts[1]
+                .parse::<u8>()
+                .map_err(|_| format!("Invalid prefix length in CIDR: '{}'", parts[1]))?;
+
+            match ip {
+                std::net::IpAddr::V4(_) => {
+                    if prefix > 32 {
+                        return Err(format!("IPv4 CIDR prefix must be 0..=32, got {}", prefix));
+                    }
+                }
+                std::net::IpAddr::V6(_) => {
+                    if prefix > 128 {
+                        return Err(format!("IPv6 CIDR prefix must be 0..=128, got {}", prefix));
+                    }
+                }
+            }
+            validated_tokens.push(format!("{}/{}", ip, prefix));
+        } else {
+            let ip = token
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| format!("Invalid IP address: '{}'", token))?;
+            validated_tokens.push(ip.to_string());
+        }
+    }
+
+    Ok(validated_tokens.join(","))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -151,5 +305,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_make_app_key_and_validators() {
+        assert_eq!(
+            make_app_key(r"C:\Windows\System32\svchost.exe", None, RuleDirection::Outbound),
+            r"c:\windows\system32\svchost.exe"
+        );
+        assert_eq!(
+            make_app_key(r"C:\Windows\System32\svchost.exe", Some("Dnscache"), RuleDirection::Outbound),
+            r"c:\windows\system32\svchost.exe::svc:dnscache"
+        );
+        assert_eq!(
+            make_app_key(r"C:\App\server.exe", None, RuleDirection::Inbound),
+            r"in::c:\app\server.exe"
+        );
+
+        assert_eq!(validate_ports_spec("80, 443, 8000-8080", NetProtocol::Tcp).unwrap(), "80,443,8000-8080");
+        assert_eq!(validate_ports_spec("443", NetProtocol::Any).unwrap(), "*");
+        assert!(validate_ports_spec("0", NetProtocol::Tcp).is_err());
+        assert!(validate_ports_spec("9000-8000", NetProtocol::Tcp).is_err());
+        assert!(validate_ports_spec("70000", NetProtocol::Udp).is_err());
+
+        assert_eq!(validate_ip_or_cidr_spec("192.168.1.1, 10.0.0.0/8").unwrap(), "192.168.1.1,10.0.0.0/8");
+        assert!(validate_ip_or_cidr_spec("999.999.1.1").is_err());
+        assert!(validate_ip_or_cidr_spec("10.0.0.1/33").is_err());
     }
 }

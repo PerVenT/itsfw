@@ -5,7 +5,7 @@ use crate::core::firewall::FirewallRuleParams;
 use crate::core::firewall::WindowsFirewallManager;
 use crate::core::monitor::EventAggregator;
 use crate::core::rules::{
-    ActiveTheme, AllowedZoneScope, AppRule, NetProtocol, RuleAction, UserConfig,
+    ActiveTheme, AllowedZoneScope, AppRule, NetProtocol, RuleAction, RuleDirection, UserConfig,
 };
 use crate::tui::theme::ThemePalette;
 
@@ -564,8 +564,11 @@ impl App {
         };
         let rule = AppRule {
             app_path: self.edit_app_path.clone(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
             action: RuleAction::Allow,
             zone_scope: AllowedZoneScope::Both,
+            custom_remote_ip: None,
             protocol: proto,
             ports: self.edit_ports.clone(),
             interface_name: None,
@@ -586,8 +589,11 @@ impl App {
         }
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
             action: RuleAction::Allow,
             zone_scope: AllowedZoneScope::Both,
+            custom_remote_ip: None,
             protocol: NetProtocol::Any,
             ports: "*".into(),
             interface_name: None,
@@ -604,8 +610,11 @@ impl App {
         }
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
             action: RuleAction::Allow,
             zone_scope: AllowedZoneScope::LanOnly,
+            custom_remote_ip: None,
             protocol: NetProtocol::Any,
             ports: "*".into(),
             interface_name: None,
@@ -633,8 +642,11 @@ impl App {
 
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
             action: RuleAction::Allow,
             zone_scope: AllowedZoneScope::Both,
+            custom_remote_ip: None,
             protocol: proto,
             ports: port.to_string(),
             interface_name: None,
@@ -652,8 +664,11 @@ impl App {
         }
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
             action: RuleAction::Block,
             zone_scope: AllowedZoneScope::Both,
+            custom_remote_ip: None,
             protocol: NetProtocol::Any,
             ports: "*".into(),
             interface_name: None,
@@ -856,8 +871,11 @@ mod tests {
             blocked_path.to_lowercase(),
             AppRule {
                 app_path: blocked_path.into(),
+                service_name: None,
+                direction: RuleDirection::Outbound,
                 action: RuleAction::Block,
                 zone_scope: AllowedZoneScope::Both,
+                custom_remote_ip: None,
                 protocol: NetProtocol::Any,
                 ports: "*".into(),
                 interface_name: None,

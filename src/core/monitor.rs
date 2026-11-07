@@ -492,8 +492,11 @@ mod tests {
             "app1".to_string(),
             crate::core::rules::AppRule {
                 app_path: r"C:\Security\malicious.exe".to_string(),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Outbound,
                 action: crate::core::rules::RuleAction::Block,
                 zone_scope: crate::core::rules::AllowedZoneScope::Both,
+                custom_remote_ip: None,
                 protocol: crate::core::rules::NetProtocol::Any,
                 ports: "*".to_string(),
                 interface_name: None,
@@ -505,8 +508,11 @@ mod tests {
             "app2".to_string(),
             crate::core::rules::AppRule {
                 app_path: r"C:\Browser\browser.exe".to_string(),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Outbound,
                 action: crate::core::rules::RuleAction::Allow,
                 zone_scope: crate::core::rules::AllowedZoneScope::Both,
+                custom_remote_ip: None,
                 protocol: crate::core::rules::NetProtocol::Any,
                 ports: "*".to_string(),
                 interface_name: None,
