@@ -1,9 +1,10 @@
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rustc-rerun-if-env-changed=ITSFW_BUILD_VERSION");
-    println!("cargo:rustc-rerun-if-changed=.git/HEAD");
-    println!("cargo:rustc-rerun-if-changed=.git/refs/tags");
+    println!("cargo:rerun-if-env-changed=ITSFW_BUILD_VERSION");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
 
     let version = std::env::var("ITSFW_BUILD_VERSION")
         .ok()

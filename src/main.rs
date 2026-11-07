@@ -18,9 +18,9 @@ const APP_VERSION: &str = env!("ITSFW_VERSION");
 
 fn format_cli_flag_output(arg: &str) -> Option<String> {
     match arg {
-        "-V" | "--version" => Some(format!("it's.fw {}", APP_VERSION)),
+        "-v" | "-V" | "--version" => Some(format!("it's.fw {}", APP_VERSION)),
         "-h" | "--help" => Some(format!(
-            "it's.fw {}\nInteractive Windows Filtering Platform & Zero-Trust Firewall TUI\n\nUSAGE:\n    itsfw [OPTIONS]\n\nOPTIONS:\n    -V, --version    Print version information\n    -h, --help       Print help information",
+            "it's.fw {}\nInteractive Windows Filtering Platform & Zero-Trust Firewall TUI\n\nUSAGE:\n    itsfw [OPTIONS]\n\nOPTIONS:\n    -v, -V, --version    Print version information\n    -h, --help           Print help information",
             APP_VERSION
         )),
         _ => None,
@@ -445,8 +445,10 @@ mod tests {
 
     #[test]
     fn test_format_cli_flag_output_version_and_help() {
-        let ver_short = format_cli_flag_output("-V").expect("should return version");
+        let ver_lower = format_cli_flag_output("-v").expect("should return version for -v");
+        let ver_short = format_cli_flag_output("-V").expect("should return version for -V");
         let ver_long = format_cli_flag_output("--version").expect("should return version");
+        assert_eq!(ver_lower, ver_short);
         assert_eq!(ver_short, ver_long);
         assert!(ver_short.starts_with("it's.fw "));
         assert!(!APP_VERSION.is_empty());
