@@ -1069,10 +1069,12 @@ impl App {
 
         #[cfg(windows)]
         {
-            if let Ok(mgr) = WindowsFirewallManager::new() {
-                let _ = mgr.remove_app_rules_for(app_path, svc.as_deref(), dir);
-                if svc.is_some() {
-                    let _ = mgr.remove_app_rules_for(app_path, None, dir);
+            if !cfg!(test) {
+                if let Ok(mgr) = WindowsFirewallManager::new() {
+                    let _ = mgr.remove_app_rules_for(app_path, svc.as_deref(), dir);
+                    if svc.is_some() {
+                        let _ = mgr.remove_app_rules_for(app_path, None, dir);
+                    }
                 }
             }
         }

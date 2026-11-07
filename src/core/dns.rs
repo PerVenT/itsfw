@@ -106,6 +106,9 @@ impl DnsResolver {
 
     #[cfg(windows)]
     pub fn new() -> Self {
+        if cfg!(test) {
+            return Self::new_empty();
+        }
         let (req_tx, req_rx) = crossbeam_channel::bounded::<IpAddr>(256);
         let cache = Arc::new(RwLock::new(HashMap::new()));
 

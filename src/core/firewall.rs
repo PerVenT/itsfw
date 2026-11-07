@@ -344,6 +344,13 @@ pub struct SystemCommandRunner;
 
 impl FirewallCommandRunner for SystemCommandRunner {
     fn execute(&self, args: &[&str]) -> anyhow::Result<CommandOutput> {
+        if cfg!(test) {
+            return Ok(CommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
         let output = std::process::Command::new("netsh").args(args).output()?;
         Ok(CommandOutput {
             success: output.status.success(),
@@ -491,6 +498,9 @@ pub struct ComFirewallBackend;
 #[cfg(windows)]
 impl ComFirewallBackend {
     pub fn new() -> anyhow::Result<Self> {
+        if cfg!(test) {
+            return Ok(Self);
+        }
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(
                 None,
@@ -503,6 +513,9 @@ impl ComFirewallBackend {
     fn policy(
         &self,
     ) -> anyhow::Result<windows::Win32::NetworkManagement::WindowsFirewall::INetFwPolicy2> {
+        if cfg!(test) {
+            anyhow::bail!("COM firewall access disabled in unit tests");
+        }
         use windows::Win32::NetworkManagement::WindowsFirewall::NetFwPolicy2;
         use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
         unsafe {
@@ -1093,8 +1106,10 @@ impl WindowsFirewallManager<SystemCommandRunner> {
     pub fn is_outbound_policy_blocking() -> bool {
         #[cfg(windows)]
         {
-            if let Ok(backend) = ComFirewallBackend::new() {
-                return backend.is_outbound_blocking();
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.is_outbound_blocking();
+                }
             }
         }
         Self::is_outbound_policy_blocking_with(&SystemCommandRunner)
@@ -1103,8 +1118,10 @@ impl WindowsFirewallManager<SystemCommandRunner> {
     pub fn is_lockdown_active() -> bool {
         #[cfg(windows)]
         {
-            if let Ok(backend) = ComFirewallBackend::new() {
-                return backend.is_lockdown_active();
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.is_lockdown_active();
+                }
             }
         }
         LOCKDOWN_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
@@ -1114,8 +1131,10 @@ impl WindowsFirewallManager<SystemCommandRunner> {
         LOCKDOWN_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
         #[cfg(windows)]
         {
-            if let Ok(backend) = ComFirewallBackend::new() {
-                return backend.set_lockdown(active);
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.set_lockdown(active);
+                }
             }
         }
         Ok(())
@@ -1126,8 +1145,10 @@ impl WindowsFirewallManager<SystemCommandRunner> {
     ) -> std::collections::HashMap<String, AppRule> {
         #[cfg(windows)]
         {
-            if let Ok(backend) = ComFirewallBackend::new() {
-                return backend.load_rules(direction);
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.load_rules(direction);
+                }
             }
         }
         Self::load_rules_from_os_with(&SystemCommandRunner, direction)
@@ -1144,8 +1165,10 @@ impl WindowsFirewallManager<SystemCommandRunner> {
     pub fn load_active_its_fw_rules() -> std::collections::HashMap<String, String> {
         #[cfg(windows)]
         {
-            if let Ok(backend) = ComFirewallBackend::new() {
-                return backend.load_active_its_fw_rules();
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.load_active_its_fw_rules();
+                }
             }
         }
         Self::load_active_its_fw_rules_with(&SystemCommandRunner)
@@ -1154,8 +1177,10 @@ impl WindowsFirewallManager<SystemCommandRunner> {
     pub fn set_outbound_policy(block: bool) -> anyhow::Result<()> {
         #[cfg(windows)]
         {
-            if let Ok(backend) = ComFirewallBackend::new() {
-                return backend.set_outbound_blocking(block);
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.set_outbound_blocking(block);
+                }
             }
         }
         Self::set_outbound_policy_with(&SystemCommandRunner, block)
@@ -1168,8 +1193,10 @@ impl WindowsFirewallManager<SystemCommandRunner> {
     ) -> anyhow::Result<usize> {
         #[cfg(windows)]
         {
-            if let Ok(backend) = ComFirewallBackend::new() {
-                return backend.remove_app_rules(app_path, service_name, direction);
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.remove_app_rules(app_path, service_name, direction);
+                }
             }
         }
         Self::remove_app_rules_with(&SystemCommandRunner, app_path, service_name, direction)
@@ -1279,7 +1306,9 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
     ) -> anyhow::Result<usize> {
         #[cfg(windows)]
         {
-            if std::any::TypeId::of::<R>() == std::any::TypeId::of::<SystemCommandRunner>() {
+            if !cfg!(test)
+                && std::any::TypeId::of::<R>() == std::any::TypeId::of::<SystemCommandRunner>()
+            {
                 if let Ok(backend) = ComFirewallBackend::new() {
                     return backend.remove_app_rules(app_path, service_name, direction);
                 }
@@ -1327,7 +1356,9 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
     pub fn apply_rule(&self, params: &FirewallRuleParams) -> anyhow::Result<()> {
         #[cfg(windows)]
         {
-            if std::any::TypeId::of::<R>() == std::any::TypeId::of::<SystemCommandRunner>() {
+            if !cfg!(test)
+                && std::any::TypeId::of::<R>() == std::any::TypeId::of::<SystemCommandRunner>()
+            {
                 if let Ok(backend) = ComFirewallBackend::new() {
                     return backend.apply_rule(params);
                 }
@@ -1407,7 +1438,9 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
     pub fn remove_rule_by_name(&self, name: &str) -> anyhow::Result<()> {
         #[cfg(windows)]
         {
-            if std::any::TypeId::of::<R>() == std::any::TypeId::of::<SystemCommandRunner>() {
+            if !cfg!(test)
+                && std::any::TypeId::of::<R>() == std::any::TypeId::of::<SystemCommandRunner>()
+            {
                 if let Ok(backend) = ComFirewallBackend::new() {
                     return backend.remove_rule_by_name(name);
                 }
@@ -1444,7 +1477,9 @@ impl<R: FirewallCommandRunner> WindowsFirewallManager<R> {
     pub fn remove_all_group_rules(&self) -> anyhow::Result<()> {
         #[cfg(windows)]
         {
-            if std::any::TypeId::of::<R>() == std::any::TypeId::of::<SystemCommandRunner>() {
+            if !cfg!(test)
+                && std::any::TypeId::of::<R>() == std::any::TypeId::of::<SystemCommandRunner>()
+            {
                 if let Ok(backend) = ComFirewallBackend::new() {
                     return backend.remove_all_group_rules();
                 }
