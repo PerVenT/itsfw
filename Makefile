@@ -116,6 +116,16 @@ sandbox-test: build-windows ## Launch isolated E2E test suite inside Windows San
 		powershell -NoProfile -ExecutionPolicy Bypass -File scripts/launch_sandbox.ps1; \
 	fi
 
+.PHONY: demo
+demo: ## Generate animated demo GIF & MP4 (13s) in assets/
+	@if command -v powershell.exe >/dev/null 2>&1; then \
+		powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/render_demo.ps1 $(ARGS); \
+	elif command -v pwsh >/dev/null 2>&1; then \
+		pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/render_demo.ps1 $(ARGS); \
+	else \
+		powershell -NoProfile -ExecutionPolicy Bypass -File scripts/render_demo.ps1 $(ARGS); \
+	fi
+
 .PHONY: clean
 clean: ## Clean build target and dist directories
 	@echo "==> Cleaning build artifacts..."

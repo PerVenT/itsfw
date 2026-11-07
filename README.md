@@ -8,6 +8,10 @@
 
 Gain complete control over what reaches the Internet and immediately detect stealthy background telemetry.
 
+<p align="center">
+  <img src="assets/demo.gif" alt="it's.fw animated demo" width="840" />
+</p>
+
 ---
 
 ## Quick Installation
