@@ -84,8 +84,13 @@ impl FirewallRuleParams {
             }
         };
 
+        let mut name = format!("{}: {} [{}]", LEGACY_FIREWALL_RULE_GROUP, target, tag);
+        if rule.is_temporary() {
+            name.push_str(" [TTL]");
+        }
+
         Self {
-            name: format!("{}: {} [{}]", LEGACY_FIREWALL_RULE_GROUP, target, tag),
+            name,
             description: format!("Created by it's.fw for {}", rule.app_path),
             grouping: FIREWALL_RULE_GROUP.to_string(),
             app_path: rule.app_path.clone(),
@@ -259,6 +264,12 @@ pub fn parse_netsh_rules(
                     },
                     interface_name: None,
                     created_at: 0,
+                    duration: if name.contains("[TTL]") {
+                        crate::core::rules::RuleDuration::UntilExit
+                    } else {
+                        crate::core::rules::RuleDuration::Permanent
+                    },
+                    expires_at: None,
                 },
             );
         }
@@ -508,6 +519,7 @@ pub trait FirewallBackend: Send + Sync {
     ) -> anyhow::Result<usize>;
     fn remove_rule_by_name(&self, name: &str) -> anyhow::Result<()>;
     fn remove_all_group_rules(&self) -> anyhow::Result<()>;
+    fn remove_temporary_rules(&self) -> anyhow::Result<usize>;
 }
 
 #[cfg(windows)]
@@ -882,6 +894,12 @@ impl FirewallBackend for ComFirewallBackend {
                                     ports,
                                     interface_name: None,
                                     created_at: 0,
+                                    duration: if name.contains("[TTL]") {
+                                        crate::core::rules::RuleDuration::UntilExit
+                                    } else {
+                                        crate::core::rules::RuleDuration::Permanent
+                                    },
+                                    expires_at: None,
                                 },
                             );
                         }
@@ -1088,6 +1106,36 @@ impl FirewallBackend for ComFirewallBackend {
         }
         Ok(())
     }
+
+    fn remove_temporary_rules(&self) -> anyhow::Result<usize> {
+        use windows::core::BSTR;
+        let policy = self.policy()?;
+        let names_to_remove = unsafe {
+            let rules = policy.Rules()?;
+            let mut names = Vec::new();
+            Self::for_each_rule(&rules, |r| {
+                let name = r.Name().map(|b| b.to_string()).unwrap_or_default();
+                let grp = r.Grouping().map(|b| b.to_string()).unwrap_or_default();
+                let is_its_fw = grp.eq_ignore_ascii_case(FIREWALL_RULE_GROUP)
+                    || grp.eq_ignore_ascii_case(LEGACY_FIREWALL_RULE_GROUP)
+                    || name.starts_with(FIREWALL_RULE_GROUP)
+                    || name.starts_with(LEGACY_FIREWALL_RULE_GROUP);
+                if is_its_fw && name.contains("[TTL]") {
+                    names.push(name);
+                }
+            });
+            names
+        };
+
+        let count = names_to_remove.len();
+        unsafe {
+            let rules = policy.Rules()?;
+            for name in names_to_remove {
+                let _ = rules.Remove(&BSTR::from(&name));
+            }
+        }
+        Ok(count)
+    }
 }
 
 #[cfg(not(windows))]
@@ -1142,6 +1190,9 @@ impl FirewallBackend for ComFirewallBackend {
     }
     fn remove_all_group_rules(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+    fn remove_temporary_rules(&self) -> anyhow::Result<usize> {
+        Ok(0)
     }
 }
 
@@ -1246,6 +1297,18 @@ impl WindowsFirewallManager<SystemCommandRunner> {
         let mut all = Self::load_rules_from_os(RuleDirection::Outbound);
         all.extend(Self::load_rules_from_os(RuleDirection::Inbound));
         all
+    }
+
+    pub fn remove_all_temporary_rules() -> usize {
+        #[cfg(windows)]
+        {
+            if !cfg!(test) {
+                if let Ok(backend) = ComFirewallBackend::new() {
+                    return backend.remove_temporary_rules().unwrap_or(0);
+                }
+            }
+        }
+        0
     }
 
     pub fn load_blocked_outbound_apps() -> std::collections::HashSet<String> {
@@ -1604,6 +1667,8 @@ mod tests {
             ports: "3000".into(),
             interface_name: None,
             created_at: 0,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
         let params = FirewallRuleParams::from_app_rule(&inbound_rule);
         assert_eq!(params.name, "its.fw: node.exe [In:Allow:LAN]");
@@ -1621,6 +1686,8 @@ mod tests {
             ports: "443".into(),
             interface_name: None,
             created_at: 0,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
         let svc_params = FirewallRuleParams::from_app_rule(&svc_rule);
         assert_eq!(
@@ -1648,6 +1715,8 @@ mod tests {
             ports: "80,443".into(),
             interface_name: Some("Wi-Fi".into()),
             created_at: 1730000000,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
 
         let params = FirewallRuleParams::from_app_rule(&rule);
@@ -1685,6 +1754,8 @@ mod tests {
             ports: "*".into(),
             interface_name: None,
             created_at: 0,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
         assert_eq!(params.remote_addresses, "any");
@@ -1815,6 +1886,8 @@ Ok.
             ports: "*".into(),
             interface_name: None,
             created_at: 0,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -1866,6 +1939,8 @@ Ok.
             ports: "80,443".into(),
             interface_name: None,
             created_at: 0,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -1913,6 +1988,8 @@ Ok.
             ports: "*".into(),
             interface_name: None,
             created_at: 0,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -1963,6 +2040,8 @@ Ok.
             ports: "8080".into(),
             interface_name: None,
             created_at: 0,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -2018,6 +2097,8 @@ Ok.
             ports: "*".into(),
             interface_name: None,
             created_at: 0,
+            duration: crate::core::rules::RuleDuration::Permanent,
+            expires_at: None,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -2166,5 +2247,30 @@ Action:                               Block
         assert!(blocked.contains(r"C:\Suspicious\malware.exe"));
         assert!(blocked.contains("malware.exe"));
         assert!(!blocked.contains(r"C:\Apps\good.exe"));
+    }
+
+    #[test]
+    fn test_temporary_rule_name_has_ttl_tag() {
+        let mut rule = AppRule {
+            app_path: r"C:\App\installer.exe".into(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
+            action: RuleAction::Allow,
+            zone_scope: AllowedZoneScope::Both,
+            custom_remote_ip: None,
+            protocol: NetProtocol::Any,
+            ports: "*".into(),
+            interface_name: None,
+            created_at: 100,
+            duration: crate::core::rules::RuleDuration::Minutes5,
+            expires_at: Some(400),
+        };
+        let params = FirewallRuleParams::from_app_rule(&rule);
+        assert_eq!(params.name, "its.fw: installer.exe [Allow:All] [TTL]");
+
+        rule.duration = crate::core::rules::RuleDuration::Permanent;
+        rule.expires_at = None;
+        let perm_params = FirewallRuleParams::from_app_rule(&rule);
+        assert_eq!(perm_params.name, "its.fw: installer.exe [Allow:All]");
     }
 }

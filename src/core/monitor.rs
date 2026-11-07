@@ -622,6 +622,8 @@ mod tests {
                 ports: "*".to_string(),
                 interface_name: None,
                 created_at: 1,
+                duration: crate::core::rules::RuleDuration::Permanent,
+                expires_at: None,
             },
         );
 
@@ -638,6 +640,8 @@ mod tests {
                 ports: "*".to_string(),
                 interface_name: None,
                 created_at: 2,
+                duration: crate::core::rules::RuleDuration::Permanent,
+                expires_at: None,
             },
         );
 

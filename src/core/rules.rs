@@ -36,6 +36,49 @@ pub enum NetProtocol {
     Udp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RuleDuration {
+    #[default]
+    Permanent,
+    Minutes5,
+    Minutes15,
+    Hour1,
+    UntilExit,
+}
+
+impl RuleDuration {
+    pub const ALL: [RuleDuration; 5] = [
+        RuleDuration::Permanent,
+        RuleDuration::Minutes5,
+        RuleDuration::Minutes15,
+        RuleDuration::Hour1,
+        RuleDuration::UntilExit,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            RuleDuration::Permanent => "Permanent",
+            RuleDuration::Minutes5 => "5m",
+            RuleDuration::Minutes15 => "15m",
+            RuleDuration::Hour1 => "1h",
+            RuleDuration::UntilExit => "Until Exit",
+        }
+    }
+
+    pub fn duration_secs(&self) -> Option<i64> {
+        match self {
+            RuleDuration::Permanent | RuleDuration::UntilExit => None,
+            RuleDuration::Minutes5 => Some(300),
+            RuleDuration::Minutes15 => Some(900),
+            RuleDuration::Hour1 => Some(3600),
+        }
+    }
+
+    pub fn is_temporary(&self) -> bool {
+        !matches!(self, RuleDuration::Permanent)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRule {
     pub app_path: String,
@@ -51,11 +94,38 @@ pub struct AppRule {
     pub ports: String, // наприклад "80,443" або "*"
     pub interface_name: Option<String>,
     pub created_at: i64,
+    #[serde(default)]
+    pub duration: RuleDuration,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
 }
 
 impl AppRule {
     pub fn composite_key(&self) -> String {
         make_app_key(&self.app_path, self.service_name.as_deref(), self.direction)
+    }
+
+    pub fn is_temporary(&self) -> bool {
+        self.duration.is_temporary() || self.expires_at.is_some()
+    }
+
+    pub fn is_expired(&self, now_ts: i64) -> bool {
+        self.expires_at.map(|exp| now_ts >= exp).unwrap_or(false)
+    }
+
+    pub fn remaining_display(&self, now_ts: i64) -> Option<String> {
+        if let Some(exp) = self.expires_at {
+            let rem = (exp - now_ts).max(0);
+            if rem >= 60 {
+                Some(format!("⏳ {}m {}s", rem / 60, rem % 60))
+            } else {
+                Some(format!("⏳ {}s", rem))
+            }
+        } else if self.duration == RuleDuration::UntilExit {
+            Some("⏳ exit".into())
+        } else {
+            None
+        }
     }
 }
 
@@ -349,5 +419,34 @@ mod tests {
         );
         assert!(validate_ip_or_cidr_spec("999.999.1.1").is_err());
         assert!(validate_ip_or_cidr_spec("10.0.0.1/33").is_err());
+    }
+
+    #[test]
+    fn test_rule_duration_expiration_and_remaining_display() {
+        let mut rule = AppRule {
+            app_path: r"C:\App\curl.exe".into(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
+            action: RuleAction::Allow,
+            zone_scope: AllowedZoneScope::Both,
+            custom_remote_ip: None,
+            protocol: NetProtocol::Any,
+            ports: "*".into(),
+            interface_name: None,
+            created_at: 1000,
+            duration: RuleDuration::Minutes15,
+            expires_at: Some(1900),
+        };
+        assert!(rule.is_temporary());
+        assert!(!rule.is_expired(1899));
+        assert!(rule.is_expired(1900));
+        assert_eq!(rule.remaining_display(1000), Some("⏳ 15m 0s".into()));
+        assert_eq!(rule.remaining_display(1855), Some("⏳ 45s".into()));
+
+        rule.duration = RuleDuration::UntilExit;
+        rule.expires_at = None;
+        assert!(rule.is_temporary());
+        assert!(!rule.is_expired(999999));
+        assert_eq!(rule.remaining_display(5000), Some("⏳ exit".into()));
     }
 }
