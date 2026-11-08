@@ -46,13 +46,13 @@ pub struct AppActivitySummary {
 }
 
 impl AppActivitySummary {
-    /// Відображає всі фактичні зони, куди звертався додаток (`LAN`, `INET`, `LAN+INET` або `-` якщо активності ще не було).
+    /// Відображає всі фактичні зони, куди звертався додаток (`LAN`, `WAN`, `LAN+WAN` або `-` якщо активності ще не було).
     pub fn zones_display(&self) -> &'static str {
         let has_lan = self.seen_zones.contains(&Zone::Lan);
         let has_inet = self.seen_zones.contains(&Zone::Internet);
         match (has_lan, has_inet) {
-            (true, true) => "LAN+INET",
-            (false, true) => "INET",
+            (true, true) => "LAN+WAN",
+            (false, true) => "WAN",
             (true, false) => "LAN",
             (false, false) => "-",
         }
@@ -581,7 +581,7 @@ mod tests {
         });
 
         let summary = aggregator.apps.get(&path.to_lowercase()).unwrap();
-        assert_eq!(summary.zones_display(), "LAN+INET");
+        assert_eq!(summary.zones_display(), "LAN+WAN");
         assert_eq!(summary.ports_display(), ":53 (+2)");
         assert_eq!(summary.all_ports_list(), ":53, :443, :10090");
         assert_eq!(summary.protocols_display(), "TCP/UDP");
@@ -708,6 +708,11 @@ mod tests {
 
         // Без подій
         assert_eq!(empty_summary.zones_display(), "-");
+        empty_summary.seen_zones.insert(Zone::Internet);
+        assert_eq!(empty_summary.zones_display(), "WAN");
+        empty_summary.seen_zones.insert(Zone::Lan);
+        assert_eq!(empty_summary.zones_display(), "LAN+WAN");
+        empty_summary.seen_zones.clear();
         assert_eq!(empty_summary.ports_display(), "-");
         assert_eq!(
             empty_summary.all_ports_list(),

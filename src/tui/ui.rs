@@ -340,8 +340,8 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
 
                     let zone_str = item.zones_display();
                     let zone_color = match zone_str {
-                        "LAN+INET" => palette.allowed_green,
-                        "INET" => palette.internet_cyan,
+                        "LAN+WAN" => palette.allowed_green,
+                        "WAN" => palette.internet_cyan,
                         "LAN" => palette.lan_yellow,
                         _ => palette.fg_muted,
                     };
@@ -583,8 +583,8 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
 
         let zone_str = selected_app.zones_display();
         let zone_color = match zone_str {
-            "LAN+INET" => palette.allowed_green,
-            "INET" => palette.internet_cyan,
+            "LAN+WAN" => palette.allowed_green,
+            "WAN" => palette.internet_cyan,
             "LAN" => palette.lan_yellow,
             _ => palette.fg_muted,
         };
@@ -660,14 +660,14 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
 
         let mut event_lines = Vec::new();
         for event in selected_app.recent_events.iter().rev().take(5) {
-            let zone_tag = match event.zone {
-                Zone::Lan => "LAN",
-                Zone::Internet => "INET",
-            };
-            let (act_tag, act_color) = if event.is_blocked {
-                ("DROP", palette.alert_red)
+            let (badge, act_color) = if event.is_blocked {
+                ("[DROP]", palette.alert_red)
             } else {
-                ("OK  ", palette.allowed_green)
+                ("[PASS]", palette.allowed_green)
+            };
+            let (zone_badge, zone_color) = match event.zone {
+                Zone::Lan => ("[LAN]", palette.lan_yellow),
+                Zone::Internet => ("[WAN]", palette.internet_cyan),
             };
             let domain = if event.remote_ip.is_loopback() {
                 crate::core::scanner::lookup_loopback_peer(event.remote_port, &event.protocol)
@@ -684,27 +684,34 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 app.dns_resolver.resolve_or_enqueue(event.remote_ip)
             };
-            let endpoint = crate::core::dns::format_recent_activity_endpoint(
-                &event.remote_ip,
-                event.remote_port,
-                &event.protocol,
-                domain.as_deref(),
-            );
-            let ev_line = Line::from(vec![
+            let extra_info = match domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(d) if d.starts_with("->") || d.starts_with('(') => d.to_string(),
+                Some(d) => format!("({})", d),
+                None => String::new(),
+            };
+            let endpoint = format!("{}:{}", event.remote_ip, event.remote_port);
+            let proto = event.protocol.to_uppercase();
+
+            let mut spans = vec![
                 Span::styled(
-                    format!("[{}] ", act_tag),
+                    badge,
                     Style::default().fg(act_color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("{} ", endpoint), Style::default().fg(palette.fg)),
-                Span::styled(
-                    format!("[{}]", zone_tag),
-                    Style::default().fg(match event.zone {
-                        Zone::Lan => palette.lan_yellow,
-                        Zone::Internet => palette.internet_cyan,
-                    }),
-                ),
-            ]);
-            event_lines.push(ev_line);
+                Span::raw(" "),
+                Span::styled(zone_badge, Style::default().fg(zone_color)),
+                Span::raw("  "),
+                Span::styled(fit_width(&endpoint, 21), Style::default().fg(palette.fg)),
+                Span::raw(" "),
+                Span::styled(fit_width(&proto, 4), Style::default().fg(palette.fg)),
+            ];
+            if !extra_info.is_empty() {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    extra_info,
+                    Style::default().fg(palette.fg_muted),
+                ));
+            }
+            event_lines.push(Line::from(spans));
         }
 
         if event_lines.is_empty() {
@@ -1598,6 +1605,9 @@ mod tests {
         assert!(out.contains("Cmd:"));
         assert!(out.contains("LAN ONLY (Explicit Rule)"));
         assert!(out.contains("Recent Activity"));
+        assert!(out.contains("[PASS]"));
+        assert!(out.contains("[WAN]"));
+        assert!(out.contains("1.1.1.1:53"));
     }
 
     #[test]

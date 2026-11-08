@@ -56,7 +56,7 @@ impl SortMode {
             SortMode::ActivityHitsDesc => "Network Activity (Most Hits)",
             SortMode::RecentActivityDesc => "Recent Activity (Last Seen)",
             SortMode::StatusPriority => "Status (Knocking → Blocked → Allowed)",
-            SortMode::ZoneInternetFirst => "Traffic Zone (INET → LAN)",
+            SortMode::ZoneInternetFirst => "Traffic Zone (WAN → LAN)",
         }
     }
 
@@ -537,8 +537,8 @@ impl App {
             SortMode::ZoneInternetFirst => {
                 let zone_rank = |item: &crate::core::monitor::AppActivitySummary| -> u8 {
                     match item.zones_display() {
-                        "LAN+INET" => 0,
-                        "INET" => 1,
+                        "LAN+WAN" => 0,
+                        "WAN" => 1,
                         "LAN" => 2,
                         _ => 3,
                     }
