@@ -37,6 +37,8 @@ pub struct AppActivitySummary {
     pub total_rx_bytes: u64,
     pub total_tx_bytes: u64,
     pub current_speed_bytes_per_sec: u64,
+    pub total_packets: u64,
+    pub current_packets_per_sec: u64,
     pub seen_zones: BTreeSet<Zone>,
     pub seen_ports: BTreeSet<u16>,
     pub seen_protocols: BTreeSet<String>,
@@ -118,6 +120,15 @@ impl AppActivitySummary {
             "-".to_string()
         }
     }
+
+    /// Відображає поточну швидкість передачі пакетів (p/s).
+    pub fn packets_per_sec_display(&self) -> String {
+        format_packets_per_sec(self.current_packets_per_sec)
+    }
+}
+
+pub fn format_packets_per_sec(pps: u64) -> String {
+    format!("{} p/s", pps)
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -209,6 +220,8 @@ impl EventAggregator {
                     total_rx_bytes: 0,
                     total_tx_bytes: 0,
                     current_speed_bytes_per_sec: 0,
+                    total_packets: 0,
+                    current_packets_per_sec: 0,
                     seen_zones: BTreeSet::new(),
                     seen_ports: BTreeSet::new(),
                     seen_protocols: BTreeSet::new(),
@@ -264,6 +277,8 @@ impl EventAggregator {
                         total_rx_bytes: 0,
                         total_tx_bytes: 0,
                         current_speed_bytes_per_sec: 0,
+                        total_packets: 0,
+                        current_packets_per_sec: 0,
                         seen_zones: BTreeSet::new(),
                         seen_ports: BTreeSet::new(),
                         seen_protocols: BTreeSet::new(),
@@ -318,6 +333,8 @@ impl EventAggregator {
             total_rx_bytes: 0,
             total_tx_bytes: 0,
             current_speed_bytes_per_sec: 0,
+            total_packets: 0,
+            current_packets_per_sec: 0,
             seen_zones: BTreeSet::new(),
             seen_ports: BTreeSet::new(),
             seen_protocols: BTreeSet::new(),
@@ -368,22 +385,26 @@ impl EventAggregator {
 
     pub fn apply_bandwidth_deltas(
         &mut self,
-        pid_deltas: &std::collections::HashMap<u32, (u64, u64)>,
+        pid_deltas: &std::collections::HashMap<u32, (u64, u64, u64)>,
         elapsed_secs: f64,
     ) {
         let window = elapsed_secs.max(0.5);
         for summary in self.apps.values_mut() {
             if summary.process_id > 0 {
-                if let Some(&(rx, tx)) = pid_deltas.get(&summary.process_id) {
+                if let Some(&(rx, tx, packets)) = pid_deltas.get(&summary.process_id) {
                     summary.total_rx_bytes = summary.total_rx_bytes.saturating_add(rx);
                     summary.total_tx_bytes = summary.total_tx_bytes.saturating_add(tx);
+                    summary.total_packets = summary.total_packets.saturating_add(packets);
                     let delta_total = rx.saturating_add(tx);
                     summary.current_speed_bytes_per_sec = (delta_total as f64 / window) as u64;
+                    summary.current_packets_per_sec = (packets as f64 / window) as u64;
                 } else {
                     summary.current_speed_bytes_per_sec = 0;
+                    summary.current_packets_per_sec = 0;
                 }
             } else {
                 summary.current_speed_bytes_per_sec = 0;
+                summary.current_packets_per_sec = 0;
             }
         }
     }
@@ -677,6 +698,8 @@ mod tests {
             total_rx_bytes: 0,
             total_tx_bytes: 0,
             current_speed_bytes_per_sec: 0,
+            total_packets: 0,
+            current_packets_per_sec: 0,
             seen_zones: BTreeSet::new(),
             seen_ports: BTreeSet::new(),
             seen_protocols: BTreeSet::new(),
@@ -849,6 +872,8 @@ mod tests {
 
         assert_eq!(format_speed(0), "0 B/s");
         assert_eq!(format_speed(1536), "1.5 KB/s");
+        assert_eq!(format_packets_per_sec(0), "0 p/s");
+        assert_eq!(format_packets_per_sec(42), "42 p/s");
 
         let summary = AppActivitySummary {
             app_path: r"C:\app.exe".into(),
@@ -866,6 +891,8 @@ mod tests {
             total_rx_bytes: 0,
             total_tx_bytes: 0,
             current_speed_bytes_per_sec: 0,
+            total_packets: 0,
+            current_packets_per_sec: 0,
             seen_zones: BTreeSet::new(),
             seen_ports: BTreeSet::new(),
             seen_protocols: BTreeSet::new(),
@@ -878,19 +905,25 @@ mod tests {
         aggregator.apps.insert("app".into(), summary);
 
         let mut deltas = std::collections::HashMap::new();
-        deltas.insert(100, (1024, 2048));
+        deltas.insert(100, (1024, 2048, 15));
         aggregator.apply_bandwidth_deltas(&deltas, 1.0);
 
         let s = aggregator.apps.get("app").unwrap();
         assert_eq!(s.total_rx_bytes, 1024);
         assert_eq!(s.total_tx_bytes, 2048);
+        assert_eq!(s.total_packets, 15);
         assert_eq!(s.current_speed_bytes_per_sec, 3072);
+        assert_eq!(s.current_packets_per_sec, 15);
         assert_eq!(s.traffic_transfer_display(), "3.0 KB/s");
+        assert_eq!(s.packets_per_sec_display(), "15 p/s");
 
         // Next tick with no deltas: speed decays to 0, display falls back to cumulative total
         aggregator.apply_bandwidth_deltas(&std::collections::HashMap::new(), 1.0);
         let s2 = aggregator.apps.get("app").unwrap();
         assert_eq!(s2.current_speed_bytes_per_sec, 0);
+        assert_eq!(s2.current_packets_per_sec, 0);
+        assert_eq!(s2.total_packets, 15);
         assert_eq!(s2.traffic_transfer_display(), "3.0 KB");
+        assert_eq!(s2.packets_per_sec_display(), "0 p/s");
     }
 }

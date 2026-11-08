@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-type EtwPidMap = HashMap<u32, (u64, u64)>;
+type EtwPidMap = HashMap<u32, (u64, u64, u64)>;
 
 static GLOBAL_ETW_ACCUMULATOR: OnceLock<Arc<Mutex<EtwPidMap>>> = OnceLock::new();
 
@@ -43,7 +43,7 @@ pub fn parse_kernel_network_payload(
 }
 
 pub struct EtwNetworkMonitor {
-    accumulator: Arc<Mutex<HashMap<u32, (u64, u64)>>>,
+    accumulator: Arc<Mutex<EtwPidMap>>,
 }
 
 impl Default for EtwNetworkMonitor {
@@ -66,8 +66,8 @@ impl EtwNetworkMonitor {
         Self { accumulator }
     }
 
-    /// Атомарно забирає накопичені дельти `(rx_bytes, tx_bytes)` по кожному `PID` з моменту попереднього виклику.
-    pub fn drain_pid_deltas(&self) -> HashMap<u32, (u64, u64)> {
+    /// Атомарно забирає накопичені дельти `(rx_bytes, tx_bytes, packet_count)` по кожному `PID` з моменту попереднього виклику.
+    pub fn drain_pid_deltas(&self) -> EtwPidMap {
         if let Ok(mut guard) = self.accumulator.lock() {
             std::mem::take(&mut *guard)
         } else {
@@ -75,11 +75,12 @@ impl EtwNetworkMonitor {
         }
     }
 
-    pub fn record_sample_for_test(&self, pid: u32, rx: u64, tx: u64) {
+    pub fn record_sample_for_test(&self, pid: u32, rx: u64, tx: u64, packets: u64) {
         if let Ok(mut guard) = self.accumulator.lock() {
-            let entry = guard.entry(pid).or_insert((0, 0));
+            let entry = guard.entry(pid).or_insert((0, 0, 0));
             entry.0 = entry.0.saturating_add(rx);
             entry.1 = entry.1.saturating_add(tx);
+            entry.2 = entry.2.saturating_add(packets);
         }
     }
 
@@ -161,9 +162,10 @@ unsafe extern "system" fn etw_event_record_callback(
         let header_pid = record.EventHeader.ProcessId;
         if let Some((pid, rx, tx)) = parse_kernel_network_payload(opcode, header_pid, slice) {
             if let Ok(mut guard) = global_accumulator().lock() {
-                let entry = guard.entry(pid).or_insert((0, 0));
+                let entry = guard.entry(pid).or_insert((0, 0, 0));
                 entry.0 = entry.0.saturating_add(rx);
                 entry.1 = entry.1.saturating_add(tx);
+                entry.2 = entry.2.saturating_add(1);
             }
         }
     }
@@ -278,10 +280,10 @@ mod tests {
     fn test_etw_monitor_drain_deltas() {
         let mon = EtwNetworkMonitor::start();
         let _ = mon.drain_pid_deltas();
-        mon.record_sample_for_test(1234, 1024, 2048);
-        mon.record_sample_for_test(1234, 512, 512);
+        mon.record_sample_for_test(1234, 1024, 2048, 2);
+        mon.record_sample_for_test(1234, 512, 512, 1);
         let deltas = mon.drain_pid_deltas();
-        assert_eq!(deltas.get(&1234), Some(&(1536, 2560)));
+        assert_eq!(deltas.get(&1234), Some(&(1536, 2560, 3)));
         assert!(mon.drain_pid_deltas().is_empty());
     }
 }
