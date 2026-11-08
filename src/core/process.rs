@@ -347,6 +347,91 @@ pub fn query_process_command_line(_pid: u32) -> Option<String> {
     None
 }
 
+/// Виділяє чисті аргументи процесу з повного командного рядка, відсікаючи шлях до виконуваного файлу.
+pub fn extract_process_arguments(cmd_line: &str) -> (Option<String>, Vec<String>) {
+    let trimmed = cmd_line.trim();
+    if trimmed.is_empty() {
+        return (None, Vec::new());
+    }
+
+    let remainder = if let Some(stripped) = trimmed.strip_prefix('"') {
+        if let Some(end_quote) = stripped.find('"') {
+            stripped[end_quote + 1..].trim()
+        } else {
+            ""
+        }
+    } else if let Some(space_idx) = trimmed.find(' ') {
+        trimmed[space_idx + 1..].trim()
+    } else {
+        ""
+    };
+
+    if remainder.is_empty() {
+        return (None, Vec::new());
+    }
+
+    let single_line = remainder.to_string();
+
+    // Розбиваємо аргументи з підтримкою лапок
+    let mut flags = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in remainder.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            ' ' | '\t' if !in_quotes => {
+                let item = current.trim();
+                if !item.is_empty() {
+                    flags.push(item.to_string());
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    let last = current.trim();
+    if !last.is_empty() {
+        flags.push(last.to_string());
+    }
+
+    (Some(single_line), flags)
+}
+
+/// Копіює текст у системний буфер обміну через штатну утиліту Windows `clip.exe`.
+pub fn copy_to_clipboard(text: &str) -> bool {
+    #[cfg(windows)]
+    {
+        if cfg!(test) {
+            return true;
+        }
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("clip")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            return child.wait().map(|s| s.success()).unwrap_or(false);
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        true
+    }
+}
+
 #[cfg(windows)]
 fn query_file_description(app_path: &str) -> Option<String> {
     use std::ffi::c_void;
@@ -856,5 +941,50 @@ mod tests {
 
         // 4. query_process_command_line(0) -> None
         assert_eq!(query_process_command_line(0), None);
+    }
+
+    #[test]
+    fn test_extract_process_arguments_quoted_and_unquoted() {
+        // 1. Quoted binary path with flags
+        let cmd =
+            r#""C:\Program Files\App\app.exe" --type=utility --port=8080 --data="hello world""#;
+        let (single, flags) = extract_process_arguments(cmd);
+        assert_eq!(
+            single.as_deref(),
+            Some(r#"--type=utility --port=8080 --data="hello world""#)
+        );
+        assert_eq!(
+            flags,
+            vec![
+                "--type=utility".to_string(),
+                "--port=8080".to_string(),
+                r#"--data="hello world""#.to_string(),
+            ]
+        );
+
+        // 2. Unquoted binary path with flags
+        let cmd2 = r#"C:\Tools\curl.exe -v https://example.com"#;
+        let (single2, flags2) = extract_process_arguments(cmd2);
+        assert_eq!(single2.as_deref(), Some("-v https://example.com"));
+        assert_eq!(
+            flags2,
+            vec!["-v".to_string(), "https://example.com".to_string()]
+        );
+
+        // 3. Binary only (no flags) -> None, empty vec
+        let cmd3 = r#""C:\App\test.exe""#;
+        let (single3, flags3) = extract_process_arguments(cmd3);
+        assert_eq!(single3, None);
+        assert!(flags3.is_empty());
+
+        // 4. Empty string
+        let (single4, flags4) = extract_process_arguments("");
+        assert_eq!(single4, None);
+        assert!(flags4.is_empty());
+    }
+
+    #[test]
+    fn test_copy_to_clipboard_test_mode() {
+        assert!(copy_to_clipboard("test text"));
     }
 }
