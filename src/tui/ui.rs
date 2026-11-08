@@ -55,6 +55,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.edit_mode {
         render_edit_modal(f, app);
     }
+
+    if app.args_modal_open {
+        render_args_modal(f, app);
+    }
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
@@ -212,11 +216,17 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
     }
     list_title_spans.push(Span::raw(" "));
 
+    let table_border_style = if app.active_pane == crate::tui::app::ActivePane::Applications {
+        Style::default().fg(palette.border_focus)
+    } else {
+        Style::default().fg(palette.border)
+    };
+
     let table_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(Line::from(list_title_spans))
-        .border_style(Style::default().fg(palette.border_focus));
+        .border_style(table_border_style);
 
     let inner = table_block.inner(area);
     f.render_widget(table_block, area);
@@ -227,11 +237,45 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(inner);
 
+        let (port_w, speed_w, vol_w, pps_w) = if inner.width < 100 {
+            (8, 8, 8, 5)
+        } else {
+            (14, 10, 9, 7)
+        };
+
+        let (sort_col, is_asc) = app.sort_mode.column_indicator();
+        let sort_arrow = if is_asc { " ▲" } else { " ▼" };
+        let app_hdr = if sort_col == "APPLICATION" {
+            format!("APPLICATION{}", sort_arrow)
+        } else {
+            "APPLICATION".to_string()
+        };
+        let hits_hdr = if sort_col == "HITS" {
+            format!("HITS{}", sort_arrow)
+        } else {
+            "HITS".to_string()
+        };
+        let speed_hdr = if sort_col == "SPEED" {
+            format!("SPEED{}", sort_arrow)
+        } else {
+            "SPEED".to_string()
+        };
+        let vol_hdr = if sort_col == "VOLUME" {
+            format!("VOLUME{}", sort_arrow)
+        } else {
+            "VOLUME".to_string()
+        };
+        let pps_hdr = if sort_col == "P/S" {
+            format!("P/S{}", sort_arrow)
+        } else {
+            "P/S".to_string()
+        };
+
         // Фіксований заголовок колонок таблиці на 100% ширини
         let table_header = Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                fit_width("APPLICATION", 26),
+                fit_width(&app_hdr, 26),
                 Style::default()
                     .fg(palette.fg_muted)
                     .add_modifier(Modifier::BOLD),
@@ -252,21 +296,35 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Span::raw(" "),
             Span::styled(
-                fit_width("PORTS", 14),
+                fit_width("PORTS", port_w),
                 Style::default()
                     .fg(palette.fg_muted)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
-                fit_width("HITS", 6),
+                fit_width(&hits_hdr, 6),
                 Style::default()
                     .fg(palette.fg_muted)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
-                fit_width("SPEED / VOL", 12),
+                fit_width(&speed_hdr, speed_w),
+                Style::default()
+                    .fg(palette.fg_muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                fit_width(&vol_hdr, vol_w),
+                Style::default()
+                    .fg(palette.fg_muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                fit_width(&pps_hdr, pps_w),
                 Style::default()
                     .fg(palette.fg_muted)
                     .add_modifier(Modifier::BOLD),
@@ -362,7 +420,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                         Span::styled(fit_width(zone_str, 9), Style::default().fg(zone_color)),
                         Span::raw(" "),
                         Span::styled(
-                            fit_width(&port_str, 14),
+                            fit_width(&port_str, port_w),
                             Style::default().fg(palette.port_purple),
                         ),
                         Span::raw(" "),
@@ -372,7 +430,27 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                         ),
                         Span::raw(" "),
                         Span::styled(
-                            fit_width(&item.traffic_transfer_display(), 12),
+                            fit_width(
+                                &crate::core::monitor::format_speed(
+                                    item.current_speed_bytes_per_sec,
+                                ),
+                                speed_w,
+                            ),
+                            Style::default().fg(palette.fg_muted),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            fit_width(
+                                &crate::core::monitor::format_bytes(
+                                    item.total_rx_bytes.saturating_add(item.total_tx_bytes),
+                                ),
+                                vol_w,
+                            ),
+                            Style::default().fg(palette.fg_muted),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            fit_width(&item.packets_per_sec_display(), pps_w),
                             Style::default().fg(palette.fg_muted),
                         ),
                     ]);
@@ -406,6 +484,12 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    let details_border_color = if app.active_pane == crate::tui::app::ActivePane::ProcessDetails {
+        palette.border_focus
+    } else {
+        palette.border
+    };
+
     let details_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -415,7 +499,7 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
                 .fg(palette.border_focus)
                 .add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(palette.border));
+        .border_style(Style::default().fg(details_border_color));
 
     if let Some(selected_app) = selected_app {
         let parent_display = match &selected_app.parent_process_name {
@@ -513,74 +597,16 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             crate::core::process::SignatureStatus::Unknown => palette.fg_muted,
         };
 
-        let mut desc_sign_spans = vec![
-            Span::styled("Desc: ", Style::default().fg(palette.fg_muted)),
-            Span::styled(fit_width(desc_display, 24), Style::default().fg(palette.fg)),
-            Span::styled("  Sign: ", Style::default().fg(palette.fg_muted)),
-            Span::styled(
-                sign_badge,
-                Style::default().fg(sign_color).add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if meta.is_suspicious_path {
-            desc_sign_spans.push(Span::styled(
-                " [⚠ SUSPICIOUS PATH]",
-                Style::default()
-                    .bg(palette.alert_red)
-                    .fg(palette.fg)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-
-        let cmd_str = meta
-            .command_line
-            .as_deref()
-            .unwrap_or(&selected_app.app_path);
-        let cmd_spans = vec![
-            Span::styled("Cmd: ", Style::default().fg(palette.fg_muted)),
-            Span::styled(
-                fit_width(cmd_str, cols[0].width.saturating_sub(7) as usize),
-                Style::default().fg(palette.fg),
-            ),
-        ];
-
-        let now_ts = crate::core::monitor::current_timestamp_secs() as i64;
-        let mut policy_spans = if let Some(ref svc) = selected_app.service_name {
-            vec![
-                Span::styled("Service: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(
-                    svc,
-                    Style::default()
-                        .fg(palette.internet_cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  Policy: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(
-                    rule_display,
-                    Style::default().fg(rule_color).add_modifier(Modifier::BOLD),
-                ),
-            ]
-        } else {
-            vec![
-                Span::styled("Policy: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(
-                    rule_display,
-                    Style::default().fg(rule_color).add_modifier(Modifier::BOLD),
-                ),
-            ]
+        let is_in_details = app.active_pane == crate::tui::app::ActivePane::ProcessDetails;
+        let pfx = |field: crate::tui::app::ProcessDetailsField| -> &'static str {
+            if is_in_details && app.details_focused_field == field {
+                "▶ "
+            } else {
+                "  "
+            }
         };
 
-        if let Some(ref rule) = configured_rule {
-            if let Some(rem) = rule.remaining_display(now_ts) {
-                policy_spans.push(Span::styled(
-                    format!(" ({})", rem),
-                    Style::default()
-                        .fg(palette.lan_yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-        }
-
+        let now_ts = crate::core::monitor::current_timestamp_secs() as i64;
         let zone_str = selected_app.zones_display();
         let zone_color = match zone_str {
             "LAN+WAN" => palette.allowed_green,
@@ -589,56 +615,177 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
             _ => palette.fg_muted,
         };
 
-        let zone_traffic_spans = vec![
-            Span::styled("Zone: ", Style::default().fg(palette.fg_muted)),
+        // Row 1: Policy & Zone
+        let mut row1_spans = vec![Span::styled(
+            pfx(crate::tui::app::ProcessDetailsField::Policy),
+            Style::default()
+                .fg(palette.internet_cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if let Some(ref svc) = selected_app.service_name {
+            row1_spans.push(Span::styled(
+                "Service: ",
+                Style::default().fg(palette.fg_muted),
+            ));
+            row1_spans.push(Span::styled(
+                svc,
+                Style::default()
+                    .fg(palette.internet_cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            row1_spans.push(Span::styled(
+                "  │  Policy: ",
+                Style::default().fg(palette.fg_muted),
+            ));
+            row1_spans.push(Span::styled(
+                rule_display,
+                Style::default().fg(rule_color).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            row1_spans.push(Span::styled(
+                "Policy: ",
+                Style::default().fg(palette.fg_muted),
+            ));
+            row1_spans.push(Span::styled(
+                rule_display,
+                Style::default().fg(rule_color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(ref rule) = configured_rule {
+            if let Some(rem) = rule.remaining_display(now_ts) {
+                row1_spans.push(Span::styled(
+                    format!(" ({})", rem),
+                    Style::default()
+                        .fg(palette.lan_yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        row1_spans.push(Span::styled(
+            "  │  Zone: ",
+            Style::default().fg(palette.fg_muted),
+        ));
+        row1_spans.push(Span::styled(
+            zone_str,
+            Style::default().fg(zone_color).add_modifier(Modifier::BOLD),
+        ));
+
+        // Row 2: App & Parent
+        let row2_spans = vec![
             Span::styled(
-                zone_str,
-                Style::default().fg(zone_color).add_modifier(Modifier::BOLD),
+                pfx(crate::tui::app::ProcessDetailsField::App),
+                Style::default()
+                    .fg(palette.internet_cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("App: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                &selected_app.app_name,
+                Style::default()
+                    .fg(palette.border_focus)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
-                    "  │  ↓ {} ↑ {} ({})",
-                    crate::core::monitor::format_bytes(selected_app.total_rx_bytes),
-                    crate::core::monitor::format_bytes(selected_app.total_tx_bytes),
-                    crate::core::monitor::format_speed(selected_app.current_speed_bytes_per_sec),
-                ),
+                format!(" ({}) │ Parent: ", selected_app.process_id),
                 Style::default().fg(palette.fg_muted),
+            ),
+            Span::styled(parent_display, Style::default().fg(palette.internet_cyan)),
+        ];
+
+        // Row 3: Desc & Signature
+        let mut row3_spans = vec![
+            Span::styled(
+                pfx(crate::tui::app::ProcessDetailsField::Desc),
+                Style::default()
+                    .fg(palette.internet_cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Desc: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(fit_width(desc_display, 24), Style::default().fg(palette.fg)),
+            Span::styled("  │  Sign: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                sign_badge,
+                Style::default().fg(sign_color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if meta.is_suspicious_path {
+            row3_spans.push(Span::styled(
+                " [⚠ SUSPICIOUS PATH]",
+                Style::default()
+                    .bg(palette.alert_red)
+                    .fg(palette.fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Row 4: Path
+        let row4_spans = vec![
+            Span::styled(
+                pfx(crate::tui::app::ProcessDetailsField::Path),
+                Style::default()
+                    .fg(palette.internet_cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Path: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                fit_width(
+                    &selected_app.app_path,
+                    cols[0].width.saturating_sub(10) as usize,
+                ),
+                Style::default().fg(palette.fg),
+            ),
+        ];
+
+        // Row 5: Args (Single row, pure arguments without redundant binary path)
+        let (clean_args, _flags) = meta
+            .command_line
+            .as_deref()
+            .map(crate::core::process::extract_process_arguments)
+            .unwrap_or((None, Vec::new()));
+        let args_display = clean_args.unwrap_or_else(|| "(none)".to_string());
+        let max_args_w = cols[0].width.saturating_sub(20) as usize;
+        let mut row5_spans = vec![
+            Span::styled(
+                pfx(crate::tui::app::ProcessDetailsField::Args),
+                Style::default()
+                    .fg(palette.internet_cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Args: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                fit_width(&args_display, max_args_w),
+                Style::default().fg(palette.fg),
+            ),
+        ];
+        if is_in_details && app.details_focused_field == crate::tui::app::ProcessDetailsField::Args
+        {
+            row5_spans.push(Span::styled(
+                " [Enter: View All]",
+                Style::default()
+                    .fg(palette.internet_cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Row 6: Windows Firewall enforcement status
+        let row6_spans = vec![
+            Span::raw("  "),
+            Span::styled("Win Firewall: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(
+                fw_sync_status,
+                Style::default()
+                    .fg(fw_sync_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ];
 
         let detail_lines = vec![
-            Line::from(vec![
-                Span::styled("App: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(
-                    &selected_app.app_name,
-                    Style::default()
-                        .fg(palette.border_focus)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" ({})  ", selected_app.process_id),
-                    Style::default().fg(palette.fg_muted),
-                ),
-                Span::styled("Parent: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(parent_display, Style::default().fg(palette.internet_cyan)),
-            ]),
-            Line::from(vec![
-                Span::styled("Path: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(&selected_app.app_path, Style::default().fg(palette.fg)),
-            ]),
-            Line::from(desc_sign_spans),
-            Line::from(cmd_spans),
-            Line::from(policy_spans),
-            Line::from(zone_traffic_spans),
-            Line::from(vec![
-                Span::styled("Win Firewall: ", Style::default().fg(palette.fg_muted)),
-                Span::styled(
-                    fw_sync_status,
-                    Style::default()
-                        .fg(fw_sync_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            Line::from(row1_spans),
+            Line::from(row2_spans),
+            Line::from(row3_spans),
+            Line::from(row4_spans),
+            Line::from(row5_spans),
+            Line::from(row6_spans),
         ];
 
         let detail_para = Paragraph::new(detail_lines).block(details_block);
@@ -647,6 +794,12 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
         // Права половинка: Recent Activity (до 5 подій)
         let count = selected_app.recent_events.len().min(5);
         let activity_title = format!(" Recent Activity ({}) ", count);
+        let activity_border_color =
+            if app.active_pane == crate::tui::app::ActivePane::RecentActivity {
+                palette.border_focus
+            } else {
+                palette.border
+            };
         let activity_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -656,7 +809,7 @@ fn render_bottom_split(f: &mut Frame, app: &mut App, area: Rect) {
                     .fg(palette.border_focus)
                     .add_modifier(Modifier::BOLD),
             ))
-            .border_style(Style::default().fg(palette.border));
+            .border_style(Style::default().fg(activity_border_color));
 
         let mut event_lines = Vec::new();
         for event in selected_app.recent_events.iter().rev().take(5) {
@@ -1184,6 +1337,126 @@ fn render_sort_modal(f: &mut Frame, app: &App) {
     f.render_widget(p, popup_area);
 }
 
+fn render_args_modal(f: &mut Frame, app: &App) {
+    let palette = app.current_palette();
+    let area = f.area();
+
+    let width = 74.min(area.width.saturating_sub(4));
+    let height = 18.min(area.height.saturating_sub(4));
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let visible = app.visible_apps();
+    let selected_app = visible.get(app.selected_index);
+    let app_title = selected_app
+        .map(|a| a.app_name.as_str())
+        .unwrap_or("Process");
+    let pid_str = selected_app.map(|a| a.process_id).unwrap_or(0);
+
+    let modal_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            format!(" Arguments: {} (PID: {}) ", app_title, pid_str),
+            Style::default()
+                .fg(palette.border_focus)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(palette.border_focus))
+        .style(Style::default().bg(palette.surface));
+
+    let inner = modal_block.inner(popup_area);
+    f.render_widget(modal_block, popup_area);
+
+    let mut lines = Vec::new();
+
+    let cmd_line_opt = selected_app.and_then(|a| {
+        let key = a.app_path.to_lowercase();
+        app.metadata_cache
+            .get(&key)
+            .and_then(|m| m.command_line.clone())
+    });
+
+    if let Some(cmd) = cmd_line_opt {
+        let (pure_args, flags) = crate::core::process::extract_process_arguments(&cmd);
+        lines.push(Line::from(vec![
+            Span::styled("Command: ", Style::default().fg(palette.fg_muted)),
+            Span::styled(cmd, Style::default().fg(palette.fg)),
+        ]));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("Parsed Flags ({} item(s)):", flags.len()),
+            Style::default()
+                .fg(palette.internet_cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+
+        if flags.is_empty() {
+            if let Some(a) = pure_args {
+                lines.push(Line::from(vec![
+                    Span::styled("  [1] ", Style::default().fg(palette.fg_muted)),
+                    Span::styled(a, Style::default().fg(palette.fg)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  (no additional arguments)",
+                    Style::default().fg(palette.fg_muted),
+                )));
+            }
+        } else {
+            for (idx, flag) in flags.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  [{}] ", idx + 1),
+                        Style::default().fg(palette.fg_muted),
+                    ),
+                    Span::styled(flag.clone(), Style::default().fg(palette.fg)),
+                ]));
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No command line arguments detected for this process.",
+            Style::default().fg(palette.fg_muted),
+        )));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "[Enter]",
+            Style::default()
+                .fg(palette.allowed_green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": Copy & Close   ", Style::default().fg(palette.fg_muted)),
+        Span::styled(
+            "[Esc]",
+            Style::default()
+                .fg(palette.alert_red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": Close   ", Style::default().fg(palette.fg_muted)),
+        Span::styled(
+            "[↑/↓/j/k]",
+            Style::default()
+                .fg(palette.internet_cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": Scroll", Style::default().fg(palette.fg_muted)),
+    ]));
+
+    let visible_lines: Vec<Line> = lines.into_iter().skip(app.args_modal_scroll).collect();
+    let para = Paragraph::new(visible_lines);
+    f.render_widget(para, inner);
+}
+
 fn render_edit_modal(f: &mut Frame, app: &App) {
     let palette = app.current_palette();
     let area = f.area();
@@ -1601,13 +1874,16 @@ mod tests {
         assert!(out.contains("APPLICATION"));
         assert!(out.contains("STATUS"));
         assert!(out.contains("TRAFFIC"));
-        assert!(out.contains("SPEED / VOL"));
+        assert!(out.contains("SPEED"));
+        assert!(out.contains("VOLUME"));
+        assert!(out.contains("P/S"));
 
         // App row and inspector fields
         assert!(out.contains("svchost.exe"));
         assert!(out.contains("Process Details"));
-        assert!(out.contains("services.exe (PID: 1024)"));
-        assert!(out.contains("Cmd:"));
+        assert!(out.contains("services.exe"));
+        assert!(out.contains("Path:"));
+        assert!(out.contains("Args:"));
         assert!(out.contains("LAN ONLY (Explicit Rule)"));
         assert!(out.contains("Recent Activity"));
         assert!(out.contains("[PASS]"));

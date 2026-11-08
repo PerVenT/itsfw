@@ -234,6 +234,27 @@ where
                     continue;
                 }
 
+                if app.args_modal_open {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.args_modal_open = false;
+                        }
+                        KeyCode::Enter => {
+                            app.copy_args_and_close_modal();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if app.args_modal_scroll > 0 {
+                                app.args_modal_scroll -= 1;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.args_modal_scroll = app.args_modal_scroll.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 if app.edit_mode {
                     match key.code {
                         KeyCode::Esc => {
@@ -349,6 +370,48 @@ where
                         }
                         _ => {}
                     }
+                    continue;
+                }
+
+                if key.code == KeyCode::BackTab
+                    || (key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::SHIFT)
+                        && key.code == KeyCode::Tab)
+                {
+                    app.cycle_active_pane();
+                    continue;
+                }
+
+                if app.active_pane == crate::tui::app::ActivePane::ProcessDetails {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.active_pane = crate::tui::app::ActivePane::Applications;
+                            continue;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.details_prev_field();
+                            continue;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.details_next_field();
+                            continue;
+                        }
+                        KeyCode::Enter
+                            if app.details_focused_field
+                                == crate::tui::app::ProcessDetailsField::Args =>
+                        {
+                            app.open_args_modal();
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if app.active_pane == crate::tui::app::ActivePane::RecentActivity
+                    && key.code == KeyCode::Esc
+                {
+                    app.active_pane = crate::tui::app::ActivePane::Applications;
                     continue;
                 }
 

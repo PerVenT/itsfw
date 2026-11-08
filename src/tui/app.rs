@@ -17,6 +17,24 @@ pub enum ViewFilter {
     BlockedOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActivePane {
+    #[default]
+    Applications,
+    ProcessDetails,
+    RecentActivity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessDetailsField {
+    #[default]
+    Policy,
+    App,
+    Desc,
+    Path,
+    Args,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirewallDirection {
     Outbound,
@@ -206,6 +224,10 @@ pub struct App {
     pub firewall_active: bool,
     pub inbound_firewall_active: bool,
     pub current_filter: ViewFilter,
+    pub active_pane: ActivePane,
+    pub details_focused_field: ProcessDetailsField,
+    pub args_modal_open: bool,
+    pub args_modal_scroll: usize,
     pub sort_mode: SortMode,
     pub sort_menu_open: bool,
     pub sort_menu_index: usize,
@@ -261,6 +283,10 @@ impl App {
             inbound_firewall_active:
                 crate::core::firewall::WindowsFirewallManager::is_inbound_policy_blocking(),
             current_filter: ViewFilter::All,
+            active_pane: ActivePane::Applications,
+            details_focused_field: ProcessDetailsField::Policy,
+            args_modal_open: false,
+            args_modal_scroll: 0,
             sort_mode: SortMode::NameAsc,
             sort_menu_open: false,
             sort_menu_index: 0,
@@ -299,6 +325,57 @@ impl App {
             dns_resolver: crate::core::dns::DnsResolver::default(),
             watcher: None,
             status_message: None,
+        }
+    }
+
+    pub fn cycle_active_pane(&mut self) {
+        self.active_pane = match self.active_pane {
+            ActivePane::Applications => ActivePane::ProcessDetails,
+            ActivePane::ProcessDetails => ActivePane::RecentActivity,
+            ActivePane::RecentActivity => ActivePane::Applications,
+        };
+    }
+
+    pub fn details_next_field(&mut self) {
+        self.details_focused_field = match self.details_focused_field {
+            ProcessDetailsField::Policy => ProcessDetailsField::App,
+            ProcessDetailsField::App => ProcessDetailsField::Desc,
+            ProcessDetailsField::Desc => ProcessDetailsField::Path,
+            ProcessDetailsField::Path => ProcessDetailsField::Args,
+            ProcessDetailsField::Args => ProcessDetailsField::Policy,
+        };
+    }
+
+    pub fn details_prev_field(&mut self) {
+        self.details_focused_field = match self.details_focused_field {
+            ProcessDetailsField::Policy => ProcessDetailsField::Args,
+            ProcessDetailsField::App => ProcessDetailsField::Policy,
+            ProcessDetailsField::Desc => ProcessDetailsField::App,
+            ProcessDetailsField::Path => ProcessDetailsField::Desc,
+            ProcessDetailsField::Args => ProcessDetailsField::Path,
+        };
+    }
+
+    pub fn open_args_modal(&mut self) {
+        self.args_modal_open = true;
+        self.args_modal_scroll = 0;
+    }
+
+    pub fn copy_args_and_close_modal(&mut self) {
+        self.args_modal_open = false;
+        let visible = self.visible_apps();
+        if let Some(app) = visible.get(self.selected_index) {
+            let meta = self.get_or_load_metadata_with_pid(&app.app_path, app.process_id);
+            if let Some(cmd) = meta.command_line {
+                let success = crate::core::process::copy_to_clipboard(&cmd);
+                if success {
+                    self.set_status("✓ Copied command line arguments to clipboard!".into());
+                } else {
+                    self.set_status("Failed to copy command line to clipboard".into());
+                }
+            } else {
+                self.set_status("No command line arguments available to copy".into());
+            }
         }
     }
 
@@ -2490,5 +2567,50 @@ mod tests {
         app.set_sort_mode(SortMode::PacketsAsc);
         let list_pps_asc = app.visible_apps();
         assert_eq!(list_pps_asc[0].app_name, "slow.exe");
+    }
+
+    #[test]
+    fn test_active_pane_cycling_and_args_modal_copy() {
+        let mut app = App::new_with_privilege(true);
+        assert_eq!(app.active_pane, ActivePane::Applications);
+
+        app.cycle_active_pane();
+        assert_eq!(app.active_pane, ActivePane::ProcessDetails);
+
+        app.cycle_active_pane();
+        assert_eq!(app.active_pane, ActivePane::RecentActivity);
+
+        app.cycle_active_pane();
+        assert_eq!(app.active_pane, ActivePane::Applications);
+
+        // Test args modal copy and exit
+        let path = r"C:\test.exe";
+        app.aggregator.record_event(NetworkEvent {
+            timestamp: 10,
+            app_path: path.into(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
+            process_id: 123,
+            parent_process_name: None,
+            remote_ip: "1.1.1.1".parse().unwrap(),
+            remote_port: 80,
+            protocol: "TCP".into(),
+            is_blocked: false,
+            zone: Zone::Internet,
+        });
+        // Pre-populate metadata cache with command line
+        let mut meta = crate::core::process::query_process_metadata(path);
+        meta.command_line = Some(r#""C:\test.exe" --foo --bar"#.into());
+        app.metadata_cache.insert(path.to_lowercase(), meta);
+
+        app.active_pane = ActivePane::ProcessDetails;
+        app.details_focused_field = ProcessDetailsField::Args;
+        app.open_args_modal();
+        assert!(app.args_modal_open);
+
+        app.copy_args_and_close_modal();
+        assert!(!app.args_modal_open);
+        assert_eq!(app.active_pane, ActivePane::ProcessDetails);
+        assert!(app.status_message.as_ref().unwrap().0.contains("Copied"));
     }
 }
