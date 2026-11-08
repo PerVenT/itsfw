@@ -5,7 +5,7 @@ mod tui;
 
 use crate::core::admin::is_running_as_admin;
 use crate::core::scanner::{scan_current_network_connections, WfpDropMonitor};
-use crate::tui::app::{App, SortMode, ViewFilter};
+use crate::tui::app::{App, ViewFilter};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -183,39 +183,51 @@ where
                             app.sort_menu_open = false;
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            app.sort_menu_index = (app.sort_menu_index + 1) % SortMode::ALL.len();
+                            app.sort_menu_index = (app.sort_menu_index + 1)
+                                % crate::tui::app::SORT_MENU_OPTIONS.len();
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             if app.sort_menu_index == 0 {
-                                app.sort_menu_index = SortMode::ALL.len() - 1;
+                                app.sort_menu_index = crate::tui::app::SORT_MENU_OPTIONS.len() - 1;
                             } else {
                                 app.sort_menu_index -= 1;
                             }
                         }
                         KeyCode::Enter => {
-                            let mode = SortMode::ALL[app.sort_menu_index];
                             app.sort_menu_open = false;
-                            app.set_sort_mode(mode);
+                            app.select_or_toggle_sort_mode(app.sort_menu_index);
                         }
                         KeyCode::Char('1') => {
                             app.sort_menu_open = false;
-                            app.set_sort_mode(SortMode::NameAsc);
+                            app.select_or_toggle_sort_mode(0);
                         }
                         KeyCode::Char('2') => {
                             app.sort_menu_open = false;
-                            app.set_sort_mode(SortMode::ActivityHitsDesc);
+                            app.select_or_toggle_sort_mode(1);
                         }
                         KeyCode::Char('3') => {
                             app.sort_menu_open = false;
-                            app.set_sort_mode(SortMode::RecentActivityDesc);
+                            app.select_or_toggle_sort_mode(2);
                         }
                         KeyCode::Char('4') => {
                             app.sort_menu_open = false;
-                            app.set_sort_mode(SortMode::StatusPriority);
+                            app.select_or_toggle_sort_mode(3);
                         }
                         KeyCode::Char('5') => {
                             app.sort_menu_open = false;
-                            app.set_sort_mode(SortMode::ZoneInternetFirst);
+                            app.select_or_toggle_sort_mode(4);
+                        }
+                        KeyCode::Char('6') => {
+                            app.sort_menu_open = false;
+                            app.select_or_toggle_sort_mode(5);
+                        }
+                        KeyCode::Char('7') => {
+                            app.sort_menu_open = false;
+                            app.select_or_toggle_sort_mode(6);
+                        }
+                        KeyCode::Char('8') => {
+                            app.sort_menu_open = false;
+                            app.select_or_toggle_sort_mode(7);
                         }
                         _ => {}
                     }

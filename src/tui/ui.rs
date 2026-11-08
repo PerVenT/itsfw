@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::core::zone::Zone;
-use crate::tui::app::{App, RuleEditorField, SortMode, ViewFilter};
+use crate::tui::app::{App, RuleEditorField, ViewFilter};
 
 /// Допоміжна функція для строгого обрізання або доповнення рядка пробілами до заданої ширини.
 fn fit_width(s: &str, width: usize) -> String {
@@ -1119,8 +1119,8 @@ fn render_sort_modal(f: &mut Frame, app: &App) {
     let palette = app.current_palette();
     let area = f.area();
 
-    let width = 48.min(area.width.saturating_sub(4));
-    let height = 9.min(area.height.saturating_sub(4));
+    let width = 52.min(area.width.saturating_sub(4));
+    let height = 12.min(area.height.saturating_sub(4));
     let popup_area = Rect {
         x: 4.min(area.width.saturating_sub(width)),
         y: 4.min(area.height.saturating_sub(height)),
@@ -1134,7 +1134,7 @@ fn render_sort_modal(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(Span::styled(
-            " Sort Applications [j/k, 1-5, Enter, Esc] ",
+            " Sort Applications [j/k, 1-8, Enter, Esc] ",
             Style::default()
                 .fg(palette.border_focus)
                 .add_modifier(Modifier::BOLD),
@@ -1142,14 +1142,19 @@ fn render_sort_modal(f: &mut Frame, app: &App) {
         .border_style(Style::default().fg(palette.border_focus))
         .style(Style::default().bg(palette.surface));
 
-    let mut lines: Vec<Line> = SortMode::ALL
+    let mut lines: Vec<Line> = crate::tui::app::SORT_MENU_OPTIONS
         .iter()
         .enumerate()
-        .map(|(idx, mode)| {
+        .map(|(idx, opt)| {
             let is_cursor = idx == app.sort_menu_index;
-            let is_active = *mode == app.sort_mode;
+            let is_active = idx == app.sort_mode.menu_index();
             let bullet = if is_active { "●" } else { " " };
-            let prefix = format!(" {} [{}] {} ", bullet, idx + 1, mode.label());
+            let display_label = if is_active {
+                app.sort_mode.label()
+            } else {
+                opt.default_mode.label()
+            };
+            let prefix = format!(" {} [{}] {} ", bullet, idx + 1, display_label);
             let style = if is_cursor {
                 Style::default()
                     .bg(palette.border)

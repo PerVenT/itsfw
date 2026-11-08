@@ -35,38 +35,155 @@ impl FirewallDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
     NameAsc,
+    NameDesc,
     ActivityHitsDesc,
+    ActivityHitsAsc,
     RecentActivityDesc,
+    RecentActivityAsc,
     StatusPriority,
     ZoneInternetFirst,
+    SpeedDesc,
+    SpeedAsc,
+    VolumeDesc,
+    VolumeAsc,
+    PacketsDesc,
+    PacketsAsc,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppSortMetrics {
+    pub total_hits: u64,
+    pub last_hit_time: u64,
+    pub current_speed: u64,
+    pub total_volume: u64,
+    pub current_packets_per_sec: u64,
+}
+
+pub struct SortMenuItemInfo {
+    pub default_mode: SortMode,
+    pub title: &'static str,
+}
+
+pub const SORT_MENU_OPTIONS: [SortMenuItemInfo; 8] = [
+    SortMenuItemInfo {
+        default_mode: SortMode::NameAsc,
+        title: "Application Name",
+    },
+    SortMenuItemInfo {
+        default_mode: SortMode::ActivityHitsDesc,
+        title: "Network Hits",
+    },
+    SortMenuItemInfo {
+        default_mode: SortMode::RecentActivityDesc,
+        title: "Recent Activity",
+    },
+    SortMenuItemInfo {
+        default_mode: SortMode::StatusPriority,
+        title: "Status Priority",
+    },
+    SortMenuItemInfo {
+        default_mode: SortMode::ZoneInternetFirst,
+        title: "Traffic Zone (WAN First)",
+    },
+    SortMenuItemInfo {
+        default_mode: SortMode::SpeedDesc,
+        title: "Transfer Speed",
+    },
+    SortMenuItemInfo {
+        default_mode: SortMode::VolumeDesc,
+        title: "Cumulative Volume",
+    },
+    SortMenuItemInfo {
+        default_mode: SortMode::PacketsDesc,
+        title: "Packet Rate (P/S)",
+    },
+];
+
 impl SortMode {
-    pub const ALL: [SortMode; 5] = [
+    pub const ALL: [SortMode; 14] = [
         SortMode::NameAsc,
+        SortMode::NameDesc,
         SortMode::ActivityHitsDesc,
+        SortMode::ActivityHitsAsc,
         SortMode::RecentActivityDesc,
+        SortMode::RecentActivityAsc,
         SortMode::StatusPriority,
         SortMode::ZoneInternetFirst,
+        SortMode::SpeedDesc,
+        SortMode::SpeedAsc,
+        SortMode::VolumeDesc,
+        SortMode::VolumeAsc,
+        SortMode::PacketsDesc,
+        SortMode::PacketsAsc,
     ];
+
+    pub fn menu_index(&self) -> usize {
+        match self {
+            SortMode::NameAsc | SortMode::NameDesc => 0,
+            SortMode::ActivityHitsDesc | SortMode::ActivityHitsAsc => 1,
+            SortMode::RecentActivityDesc | SortMode::RecentActivityAsc => 2,
+            SortMode::StatusPriority => 3,
+            SortMode::ZoneInternetFirst => 4,
+            SortMode::SpeedDesc | SortMode::SpeedAsc => 5,
+            SortMode::VolumeDesc | SortMode::VolumeAsc => 6,
+            SortMode::PacketsDesc | SortMode::PacketsAsc => 7,
+        }
+    }
 
     pub fn label(&self) -> &'static str {
         match self {
             SortMode::NameAsc => "Name (A → Z)",
-            SortMode::ActivityHitsDesc => "Network Activity (Most Hits)",
-            SortMode::RecentActivityDesc => "Recent Activity (Last Seen)",
+            SortMode::NameDesc => "Name (Z → A)",
+            SortMode::ActivityHitsDesc => "Network Hits (Most First)",
+            SortMode::ActivityHitsAsc => "Network Hits (Least First)",
+            SortMode::RecentActivityDesc => "Recent Activity (Newest First)",
+            SortMode::RecentActivityAsc => "Recent Activity (Oldest First)",
             SortMode::StatusPriority => "Status (Knocking → Blocked → Allowed)",
             SortMode::ZoneInternetFirst => "Traffic Zone (WAN → LAN)",
+            SortMode::SpeedDesc => "Transfer Speed (Highest First)",
+            SortMode::SpeedAsc => "Transfer Speed (Lowest First)",
+            SortMode::VolumeDesc => "Cumulative Volume (Highest First)",
+            SortMode::VolumeAsc => "Cumulative Volume (Lowest First)",
+            SortMode::PacketsDesc => "Packet Rate (Highest First)",
+            SortMode::PacketsAsc => "Packet Rate (Lowest First)",
         }
     }
 
     pub fn short_label(&self) -> &'static str {
         match self {
             SortMode::NameAsc => "Name ▲",
+            SortMode::NameDesc => "Name ▼",
             SortMode::ActivityHitsDesc => "Hits ▼",
+            SortMode::ActivityHitsAsc => "Hits ▲",
             SortMode::RecentActivityDesc => "Recent ▼",
+            SortMode::RecentActivityAsc => "Recent ▲",
             SortMode::StatusPriority => "Status ▼",
             SortMode::ZoneInternetFirst => "Zone ▼",
+            SortMode::SpeedDesc => "Speed ▼",
+            SortMode::SpeedAsc => "Speed ▲",
+            SortMode::VolumeDesc => "Volume ▼",
+            SortMode::VolumeAsc => "Volume ▲",
+            SortMode::PacketsDesc => "P/S ▼",
+            SortMode::PacketsAsc => "P/S ▲",
+        }
+    }
+
+    pub fn column_indicator(&self) -> (&'static str, bool) {
+        match self {
+            SortMode::NameAsc => ("APPLICATION", true),
+            SortMode::NameDesc => ("APPLICATION", false),
+            SortMode::ActivityHitsDesc => ("HITS", false),
+            SortMode::ActivityHitsAsc => ("HITS", true),
+            SortMode::RecentActivityDesc => ("RECENT", false),
+            SortMode::RecentActivityAsc => ("RECENT", true),
+            SortMode::StatusPriority => ("STATUS", false),
+            SortMode::ZoneInternetFirst => ("ZONE", false),
+            SortMode::SpeedDesc => ("SPEED", false),
+            SortMode::SpeedAsc => ("SPEED", true),
+            SortMode::VolumeDesc => ("VOLUME", false),
+            SortMode::VolumeAsc => ("VOLUME", true),
+            SortMode::PacketsDesc => ("P/S", false),
+            SortMode::PacketsAsc => ("P/S", true),
         }
     }
 }
@@ -92,7 +209,7 @@ pub struct App {
     pub sort_mode: SortMode,
     pub sort_menu_open: bool,
     pub sort_menu_index: usize,
-    pub sort_snapshot: std::collections::HashMap<String, (u64, u64)>,
+    pub sort_snapshot: std::collections::HashMap<String, AppSortMetrics>,
     pub selected_index: usize,
     pub selected_app_path: Option<String>,
     pub config: UserConfig,
@@ -303,33 +420,88 @@ impl App {
         self.sync_selection();
     }
 
-    /// Фіксує знімок метрик активності (hits, last_hit_time), щоб список НЕ стрибав кожні 2 секунди під час перегляду.
+    /// Фіксує знімок метрик активності (hits, last_hit_time, speed, volume, packets/sec), щоб список НЕ стрибав кожні 2 секунди під час перегляду.
     pub fn latch_sort_snapshot(&mut self) {
         self.sort_snapshot.clear();
         for (k, summary) in &self.aggregator.apps {
             self.sort_snapshot.insert(
                 k.to_lowercase(),
-                (summary.total_hits, summary.last_hit_time),
+                AppSortMetrics {
+                    total_hits: summary.total_hits,
+                    last_hit_time: summary.last_hit_time,
+                    current_speed: summary.current_speed_bytes_per_sec,
+                    total_volume: summary
+                        .total_rx_bytes
+                        .saturating_add(summary.total_tx_bytes),
+                    current_packets_per_sec: summary.current_packets_per_sec,
+                },
             );
         }
     }
 
     pub fn set_sort_mode(&mut self, mode: SortMode) {
         self.sort_mode = mode;
-        if let Some(pos) = SortMode::ALL.iter().position(|m| *m == mode) {
-            self.sort_menu_index = pos;
-        }
+        self.sort_menu_index = mode.menu_index();
         self.latch_sort_snapshot();
         self.sync_selection();
         self.set_status(format!("Sort: {}", mode.label()));
     }
 
+    pub fn select_or_toggle_sort_mode(&mut self, base_index: usize) {
+        let new_mode = match base_index {
+            0 => {
+                if self.sort_mode == SortMode::NameAsc {
+                    SortMode::NameDesc
+                } else {
+                    SortMode::NameAsc
+                }
+            }
+            1 => {
+                if self.sort_mode == SortMode::ActivityHitsDesc {
+                    SortMode::ActivityHitsAsc
+                } else {
+                    SortMode::ActivityHitsDesc
+                }
+            }
+            2 => {
+                if self.sort_mode == SortMode::RecentActivityDesc {
+                    SortMode::RecentActivityAsc
+                } else {
+                    SortMode::RecentActivityDesc
+                }
+            }
+            3 => SortMode::StatusPriority,
+            4 => SortMode::ZoneInternetFirst,
+            5 => {
+                if self.sort_mode == SortMode::SpeedDesc {
+                    SortMode::SpeedAsc
+                } else {
+                    SortMode::SpeedDesc
+                }
+            }
+            6 => {
+                if self.sort_mode == SortMode::VolumeDesc {
+                    SortMode::VolumeAsc
+                } else {
+                    SortMode::VolumeDesc
+                }
+            }
+            7 => {
+                if self.sort_mode == SortMode::PacketsDesc {
+                    SortMode::PacketsAsc
+                } else {
+                    SortMode::PacketsDesc
+                }
+            }
+            _ => return,
+        };
+        self.set_sort_mode(new_mode);
+    }
+
     pub fn toggle_sort_menu(&mut self) {
         self.sort_menu_open = !self.sort_menu_open;
         if self.sort_menu_open {
-            if let Some(pos) = SortMode::ALL.iter().position(|m| *m == self.sort_mode) {
-                self.sort_menu_index = pos;
-            }
+            self.sort_menu_index = self.sort_mode.menu_index();
         }
     }
 
@@ -483,19 +655,37 @@ impl App {
             SortMode::NameAsc => {
                 filtered.sort_by(name_cmp);
             }
+            SortMode::NameDesc => {
+                filtered.sort_by(|a, b| name_cmp(b, a));
+            }
             SortMode::ActivityHitsDesc => {
                 filtered.sort_by(|a, b| {
                     let hits_a = self
                         .sort_snapshot
                         .get(&a.app_path.to_lowercase())
-                        .map(|(h, _)| *h)
-                        .unwrap_or(0);
+                        .map(|m| m.total_hits)
+                        .unwrap_or(a.total_hits);
                     let hits_b = self
                         .sort_snapshot
                         .get(&b.app_path.to_lowercase())
-                        .map(|(h, _)| *h)
-                        .unwrap_or(0);
+                        .map(|m| m.total_hits)
+                        .unwrap_or(b.total_hits);
                     hits_b.cmp(&hits_a).then_with(|| name_cmp(a, b))
+                });
+            }
+            SortMode::ActivityHitsAsc => {
+                filtered.sort_by(|a, b| {
+                    let hits_a = self
+                        .sort_snapshot
+                        .get(&a.app_path.to_lowercase())
+                        .map(|m| m.total_hits)
+                        .unwrap_or(a.total_hits);
+                    let hits_b = self
+                        .sort_snapshot
+                        .get(&b.app_path.to_lowercase())
+                        .map(|m| m.total_hits)
+                        .unwrap_or(b.total_hits);
+                    hits_a.cmp(&hits_b).then_with(|| name_cmp(a, b))
                 });
             }
             SortMode::RecentActivityDesc => {
@@ -503,14 +693,29 @@ impl App {
                     let ts_a = self
                         .sort_snapshot
                         .get(&a.app_path.to_lowercase())
-                        .map(|(_, ts)| *ts)
-                        .unwrap_or(0);
+                        .map(|m| m.last_hit_time)
+                        .unwrap_or(a.last_hit_time);
                     let ts_b = self
                         .sort_snapshot
                         .get(&b.app_path.to_lowercase())
-                        .map(|(_, ts)| *ts)
-                        .unwrap_or(0);
+                        .map(|m| m.last_hit_time)
+                        .unwrap_or(b.last_hit_time);
                     ts_b.cmp(&ts_a).then_with(|| name_cmp(a, b))
+                });
+            }
+            SortMode::RecentActivityAsc => {
+                filtered.sort_by(|a, b| {
+                    let ts_a = self
+                        .sort_snapshot
+                        .get(&a.app_path.to_lowercase())
+                        .map(|m| m.last_hit_time)
+                        .unwrap_or(a.last_hit_time);
+                    let ts_b = self
+                        .sort_snapshot
+                        .get(&b.app_path.to_lowercase())
+                        .map(|m| m.last_hit_time)
+                        .unwrap_or(b.last_hit_time);
+                    ts_a.cmp(&ts_b).then_with(|| name_cmp(a, b))
                 });
             }
             SortMode::StatusPriority => {
@@ -545,6 +750,96 @@ impl App {
                 };
                 filtered
                     .sort_by(|a, b| zone_rank(a).cmp(&zone_rank(b)).then_with(|| name_cmp(a, b)));
+            }
+            SortMode::SpeedDesc => {
+                filtered.sort_by(|a, b| {
+                    let sp_a = self
+                        .sort_snapshot
+                        .get(&a.app_path.to_lowercase())
+                        .map(|m| m.current_speed)
+                        .unwrap_or(a.current_speed_bytes_per_sec);
+                    let sp_b = self
+                        .sort_snapshot
+                        .get(&b.app_path.to_lowercase())
+                        .map(|m| m.current_speed)
+                        .unwrap_or(b.current_speed_bytes_per_sec);
+                    sp_b.cmp(&sp_a).then_with(|| name_cmp(a, b))
+                });
+            }
+            SortMode::SpeedAsc => {
+                filtered.sort_by(|a, b| {
+                    let sp_a = self
+                        .sort_snapshot
+                        .get(&a.app_path.to_lowercase())
+                        .map(|m| m.current_speed)
+                        .unwrap_or(a.current_speed_bytes_per_sec);
+                    let sp_b = self
+                        .sort_snapshot
+                        .get(&b.app_path.to_lowercase())
+                        .map(|m| m.current_speed)
+                        .unwrap_or(b.current_speed_bytes_per_sec);
+                    sp_a.cmp(&sp_b).then_with(|| name_cmp(a, b))
+                });
+            }
+            SortMode::VolumeDesc => {
+                filtered.sort_by(|a, b| {
+                    let vol_a = self
+                        .sort_snapshot
+                        .get(&a.app_path.to_lowercase())
+                        .map(|m| m.total_volume)
+                        .unwrap_or_else(|| a.total_rx_bytes.saturating_add(a.total_tx_bytes));
+                    let vol_b = self
+                        .sort_snapshot
+                        .get(&b.app_path.to_lowercase())
+                        .map(|m| m.total_volume)
+                        .unwrap_or_else(|| b.total_rx_bytes.saturating_add(b.total_tx_bytes));
+                    vol_b.cmp(&vol_a).then_with(|| name_cmp(a, b))
+                });
+            }
+            SortMode::VolumeAsc => {
+                filtered.sort_by(|a, b| {
+                    let vol_a = self
+                        .sort_snapshot
+                        .get(&a.app_path.to_lowercase())
+                        .map(|m| m.total_volume)
+                        .unwrap_or_else(|| a.total_rx_bytes.saturating_add(a.total_tx_bytes));
+                    let vol_b = self
+                        .sort_snapshot
+                        .get(&b.app_path.to_lowercase())
+                        .map(|m| m.total_volume)
+                        .unwrap_or_else(|| b.total_rx_bytes.saturating_add(b.total_tx_bytes));
+                    vol_a.cmp(&vol_b).then_with(|| name_cmp(a, b))
+                });
+            }
+            SortMode::PacketsDesc => {
+                filtered.sort_by(|a, b| {
+                    let p_a = self
+                        .sort_snapshot
+                        .get(&a.app_path.to_lowercase())
+                        .map(|m| m.current_packets_per_sec)
+                        .unwrap_or(a.current_packets_per_sec);
+                    let p_b = self
+                        .sort_snapshot
+                        .get(&b.app_path.to_lowercase())
+                        .map(|m| m.current_packets_per_sec)
+                        .unwrap_or(b.current_packets_per_sec);
+                    p_b.cmp(&p_a).then_with(|| name_cmp(a, b))
+                });
+            }
+            SortMode::PacketsAsc => {
+                filtered.sort_by(|a, b| {
+                    let p_a = self
+                        .sort_snapshot
+                        .get(&a.app_path.to_lowercase())
+                        .map(|m| m.current_packets_per_sec)
+                        .unwrap_or(a.current_packets_per_sec);
+                    let p_b = self
+                        .sort_snapshot
+                        .get(&b.app_path.to_lowercase())
+                        .map(|m| m.current_packets_per_sec)
+                        .unwrap_or(b.current_packets_per_sec);
+                    p_a.cmp(&p_b).then_with(|| name_cmp(a, b))
+                });
             }
         }
 
@@ -2114,5 +2409,86 @@ mod tests {
         let expired = app.tick_expired_rules(exp);
         assert_eq!(expired.len(), 1);
         assert!(app.rule_for_app(path).is_none());
+    }
+
+    #[test]
+    fn test_sorting_modes_inversion_and_traffic_sort() {
+        let mut app = App::new_with_privilege(true);
+        // Toggle speed
+        app.select_or_toggle_sort_mode(5); // SpeedDesc
+        assert_eq!(app.sort_mode, SortMode::SpeedDesc);
+        app.select_or_toggle_sort_mode(5); // SpeedAsc
+        assert_eq!(app.sort_mode, SortMode::SpeedAsc);
+        app.select_or_toggle_sort_mode(5); // SpeedDesc
+        assert_eq!(app.sort_mode, SortMode::SpeedDesc);
+
+        // Toggle volume
+        app.select_or_toggle_sort_mode(6); // VolumeDesc
+        assert_eq!(app.sort_mode, SortMode::VolumeDesc);
+        app.select_or_toggle_sort_mode(6); // VolumeAsc
+        assert_eq!(app.sort_mode, SortMode::VolumeAsc);
+
+        // Toggle packets
+        app.select_or_toggle_sort_mode(7); // PacketsDesc
+        assert_eq!(app.sort_mode, SortMode::PacketsDesc);
+        app.select_or_toggle_sort_mode(7); // PacketsAsc
+        assert_eq!(app.sort_mode, SortMode::PacketsAsc);
+
+        // Toggle name
+        app.select_or_toggle_sort_mode(0); // NameAsc (already NameAsc or flips)
+        assert_eq!(app.sort_mode, SortMode::NameAsc);
+        app.select_or_toggle_sort_mode(0); // NameDesc
+        assert_eq!(app.sort_mode, SortMode::NameDesc);
+
+        // Populate apps with distinct traffic metrics and verify visible_apps sorting
+        app.aggregator.record_event(NetworkEvent {
+            timestamp: 10,
+            app_path: r"C:\fast.exe".into(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
+            process_id: 10,
+            parent_process_name: None,
+            remote_ip: "1.1.1.1".parse().unwrap(),
+            remote_port: 80,
+            protocol: "TCP".into(),
+            is_blocked: false,
+            zone: Zone::Internet,
+        });
+        app.aggregator.record_event(NetworkEvent {
+            timestamp: 11,
+            app_path: r"C:\slow.exe".into(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
+            process_id: 20,
+            parent_process_name: None,
+            remote_ip: "1.1.1.1".parse().unwrap(),
+            remote_port: 80,
+            protocol: "TCP".into(),
+            is_blocked: false,
+            zone: Zone::Internet,
+        });
+
+        let mut deltas = std::collections::HashMap::new();
+        deltas.insert(10, (1000, 2000, 50)); // fast: speed = 3000, vol = 3000, pps = 50
+        deltas.insert(20, (100, 200, 5)); // slow: speed = 300, vol = 300, pps = 5
+        app.aggregator.apply_bandwidth_deltas(&deltas, 1.0);
+
+        app.set_sort_mode(SortMode::SpeedDesc);
+        let list = app.visible_apps();
+        assert_eq!(list[0].app_name, "fast.exe");
+        assert_eq!(list[1].app_name, "slow.exe");
+
+        app.set_sort_mode(SortMode::SpeedAsc);
+        let list_asc = app.visible_apps();
+        assert_eq!(list_asc[0].app_name, "slow.exe");
+        assert_eq!(list_asc[1].app_name, "fast.exe");
+
+        app.set_sort_mode(SortMode::PacketsDesc);
+        let list_pps = app.visible_apps();
+        assert_eq!(list_pps[0].app_name, "fast.exe");
+
+        app.set_sort_mode(SortMode::PacketsAsc);
+        let list_pps_asc = app.visible_apps();
+        assert_eq!(list_pps_asc[0].app_name, "slow.exe");
     }
 }
