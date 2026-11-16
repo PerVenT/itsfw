@@ -1,12 +1,14 @@
 //! Керування правилами та політикою Windows Defender Firewall через COM (INetFwPolicy2 / INetFwRule).
 
 use crate::core::rules::{
-    make_app_key, AllowedZoneScope, AppRule, NetProtocol, RuleAction, RuleDirection,
+    make_app_key, normalize_registry_ra4, AllowedZoneScope, AppRule, NetProtocol, RuleAction,
+    RuleDirection, RuleTargetKind,
 };
 use crate::core::zone::Zone;
 
 pub const FIREWALL_RULE_GROUP: &str = "it's.fw";
 pub const LEGACY_FIREWALL_RULE_GROUP: &str = "its.fw";
+pub const WSL_VM_CREATOR_ID: &str = "{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirewallRuleParams {
@@ -22,11 +24,26 @@ pub struct FirewallRuleParams {
     pub local_ports: Option<String>,
     pub remote_ports: Option<String>,
     pub interface_name: Option<String>,
+    pub display_name: Option<String>,
+    pub rule_id: Option<String>,
 }
 
 impl FirewallRuleParams {
     /// Генерує параметри для правила у Windows Firewall із заданого правила додатку `AppRule`.
     pub fn from_app_rule(rule: &AppRule) -> Self {
+        let kind = RuleTargetKind::from_app_path(&rule.app_path);
+        let clean_display = rule
+            .display_name
+            .as_deref()
+            .map(|s| {
+                let t = s.trim();
+                t.strip_prefix("[WSL] ")
+                    .or_else(|| t.strip_prefix("[PORT] "))
+                    .or_else(|| t.strip_prefix("[UWP] "))
+                    .unwrap_or(t)
+            })
+            .filter(|s| !s.is_empty());
+
         let app_filename = rule
             .app_path
             .rsplit(['\\', '/'])
@@ -84,8 +101,19 @@ impl FirewallRuleParams {
             }
         };
 
-        let mut name = format!("{}: {} [{}]", LEGACY_FIREWALL_RULE_GROUP, target, tag);
-        if rule.is_temporary() {
+        let mut name = match kind {
+            RuleTargetKind::HyperV | RuleTargetKind::PortRule => {
+                let fallback_slug = rule
+                    .app_path
+                    .split_once("://")
+                    .map(|(_, s)| s)
+                    .unwrap_or(&rule.app_path);
+                clean_display.unwrap_or(fallback_slug).to_string()
+            }
+            RuleTargetKind::Uwp => clean_display.unwrap_or(&rule.app_path).to_string(),
+            RuleTargetKind::App => format!("{}: {} [{}]", LEGACY_FIREWALL_RULE_GROUP, target, tag),
+        };
+        if rule.is_temporary() && !name.contains("[TTL]") {
             name.push_str(" [TTL]");
         }
 
@@ -102,6 +130,8 @@ impl FirewallRuleParams {
             local_ports,
             remote_ports,
             interface_name: rule.interface_name.clone(),
+            display_name: rule.display_name.clone(),
+            rule_id: rule.rule_id.clone(),
         }
     }
 }
@@ -270,6 +300,9 @@ pub fn parse_netsh_rules(
                         crate::core::rules::RuleDuration::Permanent
                     },
                     expires_at: None,
+                    display_name: None,
+                    rule_id: None,
+                    is_system_or_uwp: false,
                 },
             );
         }
@@ -499,6 +532,631 @@ pub fn parse_active_its_fw_rules(text: &str) -> std::collections::HashMap<String
     map
 }
 
+pub fn parse_registry_rule_entry(
+    value_name: &str,
+    raw_value: &str,
+    is_hyperv_hive: bool,
+) -> Option<AppRule> {
+    let trimmed_val = raw_value.trim();
+    if trimmed_val.is_empty() {
+        return None;
+    }
+
+    let mut active = false;
+    let mut action: Option<RuleAction> = None;
+    let mut direction: Option<RuleDirection> = None;
+    let mut protocol_raw: Option<String> = None;
+    let mut lports: Vec<String> = Vec::new();
+    let mut rports: Vec<String> = Vec::new();
+    let mut remote_addrs: Vec<String> = Vec::new();
+    let mut app = String::new();
+    let mut svc = String::new();
+    let mut pfn = String::new();
+    let mut name = String::new();
+    let mut embed_ctxt = String::new();
+
+    for part in trimmed_val.split('|') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim();
+        if key.eq_ignore_ascii_case("Active") {
+            active = val.eq_ignore_ascii_case("TRUE");
+        } else if key.eq_ignore_ascii_case("Action") {
+            if val.eq_ignore_ascii_case("Allow") {
+                action = Some(RuleAction::Allow);
+            } else if val.eq_ignore_ascii_case("Block") {
+                action = Some(RuleAction::Block);
+            }
+        } else if key.eq_ignore_ascii_case("Dir") {
+            if val.eq_ignore_ascii_case("In") {
+                direction = Some(RuleDirection::Inbound);
+            } else if val.eq_ignore_ascii_case("Out") {
+                direction = Some(RuleDirection::Outbound);
+            }
+        } else if key.eq_ignore_ascii_case("Protocol") {
+            protocol_raw = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("LPort") {
+            if !val.is_empty() {
+                lports.push(val.to_string());
+            }
+        } else if key.eq_ignore_ascii_case("RPort") {
+            if !val.is_empty() {
+                rports.push(val.to_string());
+            }
+        } else if key.eq_ignore_ascii_case("RA4") || key.eq_ignore_ascii_case("RA6") {
+            if !val.is_empty() {
+                remote_addrs.push(val.to_string());
+            }
+        } else if key.eq_ignore_ascii_case("App") {
+            app = val.to_string();
+        } else if key.eq_ignore_ascii_case("Svc") {
+            svc = val.to_string();
+        } else if key.eq_ignore_ascii_case("PFN") {
+            pfn = val.to_string();
+        } else if key.eq_ignore_ascii_case("Name") {
+            name = val.to_string();
+        } else if key.eq_ignore_ascii_case("EmbedCtxt") {
+            embed_ctxt = val.to_string();
+        }
+    }
+
+    if !active {
+        return None;
+    }
+    let action = action?;
+    if name.ends_with(": Block LAN") || name.ends_with(": Block Internet") {
+        return None;
+    }
+
+    let direction = match direction {
+        Some(d) => d,
+        None if is_hyperv_hive => RuleDirection::Inbound,
+        None => return None,
+    };
+
+    let (app_path, display_name, is_system_or_uwp) = if is_hyperv_hive {
+        let sys_uwp = name.starts_with('@')
+            || value_name.starts_with("WslCore-")
+            || value_name.starts_with("vm-monitoring-");
+        let clean = if name.is_empty() || name.starts_with('@') {
+            value_name
+        } else {
+            name.as_str()
+        };
+        (
+            format!("wsl://{}", value_name),
+            Some(format!("[WSL] {}", clean)),
+            sys_uwp,
+        )
+    } else {
+        if !app.is_empty() || !svc.is_empty() {
+            return None;
+        }
+        if !pfn.is_empty() {
+            let clean = if name.is_empty() || name.starts_with('@') {
+                pfn.as_str()
+            } else {
+                name.as_str()
+            };
+            (
+                format!("uwp://{}", pfn),
+                Some(format!("[UWP] {}", clean)),
+                true,
+            )
+        } else {
+            let sys_uwp = name.starts_with('@')
+                || embed_ctxt.starts_with('@')
+                || value_name.starts_with("HNS Container Networking")
+                || value_name.starts_with("CoreNet-")
+                || value_name.starts_with("FPS-")
+                || value_name.starts_with("NETDIS-");
+            let clean = if name.is_empty() || name.starts_with('@') {
+                value_name
+            } else {
+                name.as_str()
+            };
+            (
+                format!("port://{}", value_name),
+                Some(format!("[PORT] {}", clean)),
+                sys_uwp,
+            )
+        }
+    };
+
+    let protocol = match protocol_raw.as_deref() {
+        Some("6") => NetProtocol::Tcp,
+        Some("17") => NetProtocol::Udp,
+        Some("256") | None => NetProtocol::Any,
+        Some(_) => {
+            if is_hyperv_hive || !pfn.is_empty() {
+                NetProtocol::Any
+            } else if lports.is_empty() && rports.is_empty() {
+                return None;
+            } else {
+                NetProtocol::Any
+            }
+        }
+    };
+
+    let ports_vec = match direction {
+        RuleDirection::Inbound => lports,
+        RuleDirection::Outbound => {
+            if rports.is_empty() {
+                lports
+            } else {
+                rports
+            }
+        }
+    };
+    let ports = if ports_vec.is_empty() {
+        "*".to_string()
+    } else {
+        ports_vec.join(",")
+    };
+
+    let mut has_local_subnet = false;
+    let mut custom_ips: Vec<String> = Vec::new();
+    for ra in remote_addrs {
+        if ra.eq_ignore_ascii_case("LocalSubnet") {
+            has_local_subnet = true;
+        } else if ra != "*" && !ra.eq_ignore_ascii_case("Any") {
+            if let Some(norm) = normalize_registry_ra4(&ra) {
+                if !custom_ips.contains(&norm) {
+                    custom_ips.push(norm);
+                }
+            } else if !custom_ips.contains(&ra) {
+                custom_ips.push(ra);
+            }
+        }
+    }
+
+    let (zone_scope, custom_remote_ip) = if has_local_subnet && custom_ips.is_empty() {
+        (AllowedZoneScope::LanOnly, None)
+    } else if !custom_ips.is_empty() {
+        (AllowedZoneScope::Both, Some(custom_ips.join(",")))
+    } else {
+        (AllowedZoneScope::Both, None)
+    };
+
+    Some(AppRule {
+        app_path,
+        service_name: None,
+        direction,
+        action,
+        zone_scope,
+        custom_remote_ip,
+        protocol,
+        ports,
+        interface_name: None,
+        created_at: 0,
+        duration: if name.contains("[TTL]") {
+            crate::core::rules::RuleDuration::UntilExit
+        } else {
+            crate::core::rules::RuleDuration::Permanent
+        },
+        expires_at: None,
+        display_name,
+        rule_id: Some(value_name.to_string()),
+        is_system_or_uwp,
+    })
+}
+
+pub fn sanitize_rule_slug(input: &str) -> String {
+    let slug: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "itsfw-rule".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn escape_ps_single_quoted(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .replace('\'', "''")
+}
+
+pub fn build_hyperv_registry_rule_string(params: &FirewallRuleParams) -> (String, String) {
+    let raw_slug = params
+        .rule_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            params
+                .app_path
+                .split_once("://")
+                .map(|(_, s)| s)
+                .filter(|s| !s.is_empty() && !s.starts_with("knock/"))
+        })
+        .unwrap_or(&params.name);
+
+    let rule_id = if raw_slug.contains(' ') || raw_slug.starts_with("knock/") {
+        sanitize_rule_slug(raw_slug)
+    } else {
+        raw_slug.to_string()
+    };
+
+    let clean_name = params
+        .display_name
+        .as_deref()
+        .map(|s| s.trim().strip_prefix("[WSL] ").unwrap_or(s.trim()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&params.name);
+
+    let mut parts = vec![
+        "v2.33".to_string(),
+        format!(
+            "Action={}",
+            match params.action {
+                RuleAction::Allow => "Allow",
+                RuleAction::Block => "Block",
+            }
+        ),
+        "Active=TRUE".to_string(),
+        format!(
+            "Dir={}",
+            match params.direction {
+                RuleDirection::Inbound => "In",
+                RuleDirection::Outbound => "Out",
+            }
+        ),
+        format!("VMCreatorId={}", WSL_VM_CREATOR_ID),
+    ];
+
+    match params.protocol {
+        NetProtocol::Tcp => parts.push("Protocol=6".to_string()),
+        NetProtocol::Udp => parts.push("Protocol=17".to_string()),
+        NetProtocol::Any => {}
+    }
+
+    let port_spec = match params.direction {
+        RuleDirection::Inbound => params.local_ports.as_deref(),
+        RuleDirection::Outbound => params.remote_ports.as_deref(),
+    };
+    if let Some(pspec) = port_spec {
+        for p in pspec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if p != "*" && !p.eq_ignore_ascii_case("any") {
+                match params.direction {
+                    RuleDirection::Inbound => parts.push(format!("LPort={}", p)),
+                    RuleDirection::Outbound => parts.push(format!("RPort={}", p)),
+                }
+            }
+        }
+    }
+
+    let raddr = params.remote_addresses.trim();
+    if !raddr.is_empty() && raddr != "*" && !raddr.eq_ignore_ascii_case("any") {
+        let dotted = crate::core::rules::cidr_to_dotted_mask(raddr);
+        for token in dotted.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if token.eq_ignore_ascii_case("LocalSubnet") {
+                parts.push("RA4=LocalSubnet".to_string());
+            } else if token.contains(':') {
+                parts.push(format!("RA6={}", token));
+            } else {
+                parts.push(format!("RA4={}", token));
+            }
+        }
+    }
+
+    parts.push(format!("Name={}", clean_name));
+    let mut reg_val = parts.join("|");
+    reg_val.push('|');
+    (rule_id, reg_val)
+}
+
+pub fn build_hyperv_powershell_upsert_cmd(rule_id: &str, params: &FirewallRuleParams) -> String {
+    let escaped_id = escape_ps_single_quoted(rule_id);
+    let clean_name = params
+        .display_name
+        .as_deref()
+        .map(|s| s.trim().strip_prefix("[WSL] ").unwrap_or(s.trim()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&params.name);
+    let escaped_name = escape_ps_single_quoted(clean_name);
+
+    let dir_str = match params.direction {
+        RuleDirection::Inbound => "Inbound",
+        RuleDirection::Outbound => "Outbound",
+    };
+    let act_str = match params.action {
+        RuleAction::Allow => "Allow",
+        RuleAction::Block => "Block",
+    };
+
+    let mut cmd = format!(
+        "Remove-NetFirewallHyperVRule -Name '{}' -ErrorAction SilentlyContinue; New-NetFirewallHyperVRule -Name '{}' -DisplayName '{}' -Direction {} -VMCreatorId '{}' -Action {}",
+        escaped_id, escaped_id, escaped_name, dir_str, WSL_VM_CREATOR_ID, act_str
+    );
+
+    match params.protocol {
+        NetProtocol::Tcp => cmd.push_str(" -Protocol TCP"),
+        NetProtocol::Udp => cmd.push_str(" -Protocol UDP"),
+        NetProtocol::Any => {}
+    }
+
+    let port_spec = match params.direction {
+        RuleDirection::Inbound => params.local_ports.as_deref(),
+        RuleDirection::Outbound => params.remote_ports.as_deref(),
+    };
+    if let Some(pspec) = port_spec {
+        let items: Vec<String> = pspec
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "*" && !s.eq_ignore_ascii_case("any"))
+            .map(|s| format!("'{}'", escape_ps_single_quoted(s)))
+            .collect();
+        if !items.is_empty() {
+            let flag = match params.direction {
+                RuleDirection::Inbound => "-LocalPorts",
+                RuleDirection::Outbound => "-RemotePorts",
+            };
+            cmd.push_str(&format!(" {} @({})", flag, items.join(",")));
+        }
+    }
+
+    let raddr = params.remote_addresses.trim();
+    if !raddr.is_empty() && raddr != "*" && !raddr.eq_ignore_ascii_case("any") {
+        let items: Vec<String> = raddr
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("'{}'", escape_ps_single_quoted(s)))
+            .collect();
+        if !items.is_empty() {
+            cmd.push_str(&format!(" -RemoteAddresses @({})", items.join(",")));
+        }
+    }
+
+    cmd
+}
+
+#[cfg(windows)]
+fn spawn_powershell_background(ps_cmd: String) {
+    if cfg!(test) {
+        return;
+    }
+    std::thread::spawn(move || {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &ps_cmd,
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    });
+}
+
+#[cfg(windows)]
+fn for_each_registry_rule_raw<F: FnMut(&str, &str)>(subkey: windows::core::PCWSTR, mut f: F) {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
+    };
+
+    let mut hkey = HKEY::default();
+    let open_err =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, Some(0), KEY_READ, &mut hkey) };
+    if open_err != ERROR_SUCCESS {
+        return;
+    }
+
+    let mut index = 0u32;
+    let mut name_buf = vec![0u16; 1024];
+    let mut data_buf = vec![0u8; 8192];
+    let mut retries = 0u8;
+
+    loop {
+        let mut name_len = name_buf.len() as u32;
+        let mut val_type = 0u32;
+        let mut data_len = data_buf.len() as u32;
+
+        let res = unsafe {
+            RegEnumValueW(
+                hkey,
+                index,
+                Some(PWSTR(name_buf.as_mut_ptr())),
+                &mut name_len,
+                None,
+                Some(&mut val_type),
+                Some(data_buf.as_mut_ptr()),
+                Some(&mut data_len),
+            )
+        };
+
+        if res == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if res == ERROR_MORE_DATA && retries < 4 {
+            retries += 1;
+            data_buf.resize(data_buf.len().max(data_len as usize) + 4096, 0);
+            if (name_len as usize) + 1 >= name_buf.len() {
+                name_buf.resize(name_buf.len() * 2, 0);
+            }
+            continue;
+        }
+        retries = 0;
+        index += 1;
+
+        if res != ERROR_SUCCESS || val_type != REG_SZ.0 {
+            continue;
+        }
+
+        let val_name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+        let u16_count = (data_len as usize) / 2;
+        let mut u16_slice = Vec::with_capacity(u16_count);
+        for i in 0..u16_count {
+            u16_slice.push(u16::from_le_bytes([data_buf[i * 2], data_buf[i * 2 + 1]]));
+        }
+        let raw_val = String::from_utf16_lossy(&u16_slice)
+            .trim_end_matches('\0')
+            .to_string();
+        f(&val_name, &raw_val);
+    }
+
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+}
+
+#[cfg(windows)]
+fn read_registry_rules_hive(
+    subkey: windows::core::PCWSTR,
+    is_hyperv_hive: bool,
+    target_dir: RuleDirection,
+    map: &mut std::collections::HashMap<String, AppRule>,
+) {
+    for_each_registry_rule_raw(subkey, |val_name, raw_val| {
+        if let Some(rule) = parse_registry_rule_entry(val_name, raw_val, is_hyperv_hive) {
+            if rule.direction != target_dir {
+                return;
+            }
+            let key = rule.composite_key();
+            if let Some(existing) = map.get(&key) {
+                if existing.action == RuleAction::Block && rule.action == RuleAction::Allow {
+                    return;
+                }
+            }
+            map.insert(key, rule);
+        }
+    });
+}
+
+#[cfg(windows)]
+fn lookup_registry_rule_display_name(
+    subkey: windows::core::PCWSTR,
+    target_value_name: &str,
+) -> Option<String> {
+    let mut found = None;
+    for_each_registry_rule_raw(subkey, |val_name, raw_val| {
+        if val_name.eq_ignore_ascii_case(target_value_name) {
+            for part in raw_val.split('|') {
+                if let Some((k, v)) = part.split_once('=') {
+                    if k.trim().eq_ignore_ascii_case("Name") {
+                        found = Some(v.trim().to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    found
+}
+
+#[cfg(windows)]
+fn lookup_uwp_rule_names_by_pfn(pfn: &str, target_dir: RuleDirection) -> Vec<String> {
+    let mut names = Vec::new();
+    let dir_token = match target_dir {
+        RuleDirection::Inbound => "In",
+        RuleDirection::Outbound => "Out",
+    };
+    let subkey = windows::core::w!(
+        "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules"
+    );
+    for_each_registry_rule_raw(subkey, |_val_name, raw_val| {
+        let mut pfn_match = false;
+        let mut dir_match = false;
+        let mut rule_name = String::new();
+        for part in raw_val.split('|') {
+            if let Some((k, v)) = part.split_once('=') {
+                let kt = k.trim();
+                let vt = v.trim();
+                if kt.eq_ignore_ascii_case("PFN") && vt.eq_ignore_ascii_case(pfn) {
+                    pfn_match = true;
+                } else if kt.eq_ignore_ascii_case("Dir") && vt.eq_ignore_ascii_case(dir_token) {
+                    dir_match = true;
+                } else if kt.eq_ignore_ascii_case("Name") {
+                    rule_name = vt.to_string();
+                }
+            }
+        }
+        if pfn_match && dir_match && !rule_name.is_empty() && !names.contains(&rule_name) {
+            names.push(rule_name);
+        }
+    });
+    names
+}
+
+#[cfg(windows)]
+fn write_hyperv_registry_rule(value_name: &str, reg_sz_value: &str) -> anyhow::Result<()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_SZ,
+    };
+    let subkey = windows::core::w!(
+        "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\HyperVRules"
+    );
+    let mut hkey = HKEY::default();
+    let open_err =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, Some(0), KEY_WRITE, &mut hkey) };
+    if open_err != ERROR_SUCCESS {
+        anyhow::bail!("Failed to open HyperVRules registry key: {:?}", open_err);
+    }
+    let wide_val: Vec<u16> = reg_sz_value
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let byte_slice =
+        unsafe { std::slice::from_raw_parts(wide_val.as_ptr() as *const u8, wide_val.len() * 2) };
+    let name_hstr = HSTRING::from(value_name);
+    let set_err = unsafe { RegSetValueExW(hkey, &name_hstr, None, REG_SZ, Some(byte_slice)) };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    if set_err != ERROR_SUCCESS {
+        anyhow::bail!("Failed to write HyperVRules registry value: {:?}", set_err);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn delete_hyperv_registry_rule(value_name: &str) -> anyhow::Result<()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE,
+    };
+    let subkey = windows::core::w!(
+        "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\HyperVRules"
+    );
+    let mut hkey = HKEY::default();
+    let open_err =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, Some(0), KEY_WRITE, &mut hkey) };
+    if open_err != ERROR_SUCCESS {
+        anyhow::bail!("Failed to open HyperVRules registry key: {:?}", open_err);
+    }
+    let name_hstr = HSTRING::from(value_name);
+    let del_err = unsafe { RegDeleteValueW(hkey, &name_hstr) };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    if del_err != ERROR_SUCCESS {
+        anyhow::bail!("Failed to delete HyperVRules value: {:?}", del_err);
+    }
+    Ok(())
+}
+
 static LOCKDOWN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub trait FirewallBackend: Send + Sync {
@@ -608,7 +1266,9 @@ impl ComFirewallBackend {
             fw_rule.SetName(&BSTR::from(&params.name))?;
             fw_rule.SetDescription(&BSTR::from(&params.description))?;
             fw_rule.SetGrouping(&BSTR::from(&params.grouping))?;
-            if !params.app_path.is_empty() {
+            if RuleTargetKind::from_app_path(&params.app_path) == RuleTargetKind::App
+                && !params.app_path.is_empty()
+            {
                 fw_rule.SetApplicationName(&BSTR::from(&params.app_path))?;
             }
             if let Some(ref svc) = params.service_name {
@@ -651,6 +1311,71 @@ impl ComFirewallBackend {
             fw_rule.SetProfiles(NET_FW_PROFILE2_ALL.0)?;
             fw_rule.SetEnabled(VARIANT_TRUE)?;
             rules.Add(&fw_rule)?;
+        }
+        Ok(())
+    }
+
+    fn apply_uwp_rule(&self, params: &FirewallRuleParams) -> anyhow::Result<()> {
+        use windows::core::{Interface, BSTR};
+        use windows::Win32::NetworkManagement::WindowsFirewall::{
+            INetFwRule3, NET_FW_ACTION_ALLOW, NET_FW_ACTION_BLOCK, NET_FW_RULE_DIR_IN,
+            NET_FW_RULE_DIR_OUT,
+        };
+        let pfn = params
+            .app_path
+            .split_once("://")
+            .map(|(_, s)| s)
+            .unwrap_or(&params.app_path);
+        let target_names = lookup_uwp_rule_names_by_pfn(pfn, params.direction);
+        let target_dir = match params.direction {
+            RuleDirection::Outbound => NET_FW_RULE_DIR_OUT,
+            RuleDirection::Inbound => NET_FW_RULE_DIR_IN,
+        };
+        let target_action = match params.action {
+            RuleAction::Allow => NET_FW_ACTION_ALLOW,
+            RuleAction::Block => NET_FW_ACTION_BLOCK,
+        };
+        let target_addr = if params.remote_addresses.trim().eq_ignore_ascii_case("any")
+            || params.remote_addresses.trim().is_empty()
+        {
+            "*".to_string()
+        } else {
+            params.remote_addresses.clone()
+        };
+
+        let policy = self.policy()?;
+        let mut updated = 0usize;
+        unsafe {
+            let rules = policy.Rules()?;
+            Self::for_each_rule(&rules, |r| {
+                if let Ok(dir) = r.Direction() {
+                    if dir != target_dir {
+                        return;
+                    }
+                }
+                let prog = r
+                    .ApplicationName()
+                    .map(|b| b.to_string())
+                    .unwrap_or_default();
+                if !prog.is_empty() {
+                    return;
+                }
+                let name = r.Name().map(|b| b.to_string()).unwrap_or_default();
+                let pkg_match = r
+                    .cast::<INetFwRule3>()
+                    .and_then(|r3| r3.LocalAppPackageId())
+                    .map(|b| b.to_string().eq_ignore_ascii_case(pfn))
+                    .unwrap_or(false);
+                if (pkg_match || target_names.iter().any(|n| n.eq_ignore_ascii_case(&name)))
+                    && r.SetAction(target_action).is_ok()
+                {
+                    let _ = r.SetRemoteAddresses(&BSTR::from(&target_addr));
+                    updated += 1;
+                }
+            });
+        }
+        if updated == 0 {
+            anyhow::bail!("No matching UWP firewall rule found for {}", pfn);
         }
         Ok(())
     }
@@ -900,6 +1625,9 @@ impl FirewallBackend for ComFirewallBackend {
                                         crate::core::rules::RuleDuration::Permanent
                                     },
                                     expires_at: None,
+                                    display_name: None,
+                                    rule_id: None,
+                                    is_system_or_uwp: false,
                                 },
                             );
                         }
@@ -907,6 +1635,22 @@ impl FirewallBackend for ComFirewallBackend {
                 }
             }
         }
+        read_registry_rules_hive(
+            windows::core::w!(
+                "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\HyperVRules"
+            ),
+            true,
+            direction,
+            &mut map,
+        );
+        read_registry_rules_hive(
+            windows::core::w!(
+                "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules"
+            ),
+            false,
+            direction,
+            &mut map,
+        );
         map
     }
 
@@ -937,6 +1681,9 @@ impl FirewallBackend for ComFirewallBackend {
                             .map(|b| b.to_string())
                             .unwrap_or_default();
                         let svc = r.ServiceName().map(|b| b.to_string()).unwrap_or_default();
+                        if prog.is_empty() && svc.is_empty() {
+                            return;
+                        }
                         let dir = match r.Direction() {
                             Ok(d) if d == NET_FW_RULE_DIR_IN => RuleDirection::Inbound,
                             _ => RuleDirection::Outbound,
@@ -959,11 +1706,34 @@ impl FirewallBackend for ComFirewallBackend {
     }
 
     fn apply_rule(&self, params: &FirewallRuleParams) -> anyhow::Result<()> {
+        match RuleTargetKind::from_app_path(&params.app_path) {
+            RuleTargetKind::HyperV => {
+                let (rule_id, reg_val) = build_hyperv_registry_rule_string(params);
+                if cfg!(test) {
+                    return Ok(());
+                }
+                write_hyperv_registry_rule(&rule_id, &reg_val)?;
+                let ps_cmd = build_hyperv_powershell_upsert_cmd(&rule_id, params);
+                spawn_powershell_background(ps_cmd);
+                return Ok(());
+            }
+            RuleTargetKind::Uwp => {
+                if cfg!(test) {
+                    return Ok(());
+                }
+                return self.apply_uwp_rule(params);
+            }
+            RuleTargetKind::PortRule | RuleTargetKind::App => {}
+        }
+
         let _ = self.remove_app_rules(
             &params.app_path,
             params.service_name.as_deref(),
             params.direction,
         );
+        if RuleTargetKind::from_app_path(&params.app_path) == RuleTargetKind::PortRule {
+            let _ = self.remove_rule_by_name(&params.name);
+        }
 
         if params.action == RuleAction::Allow
             && (params.name.contains("[Allow:Internet]")
@@ -982,6 +1752,8 @@ impl FirewallBackend for ComFirewallBackend {
                 local_ports: params.local_ports.clone(),
                 remote_ports: params.remote_ports.clone(),
                 interface_name: params.interface_name.clone(),
+                display_name: params.display_name.clone(),
+                rule_id: params.rule_id.clone(),
             };
             self.add_single_rule(&block_lan_params)?;
         }
@@ -1002,6 +1774,8 @@ impl FirewallBackend for ComFirewallBackend {
                 local_ports: params.local_ports.clone(),
                 remote_ports: params.remote_ports.clone(),
                 interface_name: params.interface_name.clone(),
+                display_name: params.display_name.clone(),
+                rule_id: params.rule_id.clone(),
             };
             self.add_single_rule(&block_inet_params)?;
         }
@@ -1017,8 +1791,133 @@ impl FirewallBackend for ComFirewallBackend {
     ) -> anyhow::Result<usize> {
         use windows::core::BSTR;
         use windows::Win32::NetworkManagement::WindowsFirewall::{
-            NET_FW_RULE_DIR_IN, NET_FW_RULE_DIR_OUT,
+            NET_FW_ACTION_ALLOW, NET_FW_RULE_DIR_IN, NET_FW_RULE_DIR_OUT,
         };
+
+        match RuleTargetKind::from_app_path(app_path) {
+            RuleTargetKind::HyperV => {
+                if cfg!(test) {
+                    return Ok(0);
+                }
+                let slug = app_path
+                    .split_once("://")
+                    .map(|(_, s)| s)
+                    .unwrap_or(app_path);
+                if slug.starts_with("knock/") {
+                    return Ok(0);
+                }
+                let removed = delete_hyperv_registry_rule(slug).is_ok();
+                let escaped = escape_ps_single_quoted(slug);
+                spawn_powershell_background(format!(
+                    "Remove-NetFirewallHyperVRule -Name '{}' -ErrorAction SilentlyContinue",
+                    escaped
+                ));
+                return Ok(if removed { 1 } else { 0 });
+            }
+            RuleTargetKind::PortRule => {
+                if cfg!(test) {
+                    return Ok(0);
+                }
+                let key_id = app_path
+                    .split_once("://")
+                    .map(|(_, s)| s)
+                    .unwrap_or(app_path);
+                let target_dir = match direction {
+                    RuleDirection::Outbound => NET_FW_RULE_DIR_OUT,
+                    RuleDirection::Inbound => NET_FW_RULE_DIR_IN,
+                };
+                let reg_name = lookup_registry_rule_display_name(
+                    windows::core::w!(
+                        "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules"
+                    ),
+                    key_id,
+                );
+                let mut candidate_names = vec![key_id.to_string()];
+                if let Some(rn) = reg_name {
+                    candidate_names.push(rn.clone());
+                    candidate_names.push(format!("{}: Block LAN", rn));
+                    candidate_names.push(format!("{}: Block Internet", rn));
+                }
+                let policy = self.policy()?;
+                let to_remove = unsafe {
+                    let rules = policy.Rules()?;
+                    let mut names = Vec::new();
+                    Self::for_each_rule(&rules, |r| {
+                        if let Ok(dir) = r.Direction() {
+                            if dir != target_dir {
+                                return;
+                            }
+                        }
+                        let prog = r
+                            .ApplicationName()
+                            .map(|b| b.to_string())
+                            .unwrap_or_default();
+                        if !prog.is_empty() {
+                            return;
+                        }
+                        let name = r.Name().map(|b| b.to_string()).unwrap_or_default();
+                        if candidate_names
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&name))
+                        {
+                            names.push(name);
+                        }
+                    });
+                    names
+                };
+                let count = to_remove.len();
+                unsafe {
+                    let rules = policy.Rules()?;
+                    for n in to_remove {
+                        let _ = rules.Remove(&BSTR::from(&n));
+                    }
+                }
+                return Ok(count);
+            }
+            RuleTargetKind::Uwp => {
+                if cfg!(test) {
+                    return Ok(0);
+                }
+                let pfn = app_path
+                    .split_once("://")
+                    .map(|(_, s)| s)
+                    .unwrap_or(app_path);
+                let target_names = lookup_uwp_rule_names_by_pfn(pfn, direction);
+                let target_dir = match direction {
+                    RuleDirection::Outbound => NET_FW_RULE_DIR_OUT,
+                    RuleDirection::Inbound => NET_FW_RULE_DIR_IN,
+                };
+                let policy = self.policy()?;
+                let mut count = 0usize;
+                unsafe {
+                    let rules = policy.Rules()?;
+                    Self::for_each_rule(&rules, |r| {
+                        if let Ok(dir) = r.Direction() {
+                            if dir != target_dir {
+                                return;
+                            }
+                        }
+                        let prog = r
+                            .ApplicationName()
+                            .map(|b| b.to_string())
+                            .unwrap_or_default();
+                        if !prog.is_empty() {
+                            return;
+                        }
+                        let name = r.Name().map(|b| b.to_string()).unwrap_or_default();
+                        if target_names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                            if r.SetAction(NET_FW_ACTION_ALLOW).is_ok() {
+                                count += 1;
+                            }
+                            let _ = r.SetRemoteAddresses(&BSTR::from("*"));
+                        }
+                    });
+                }
+                return Ok(count);
+            }
+            RuleTargetKind::App => {}
+        }
+
         let policy = self.policy()?;
         let target_dir = match direction {
             RuleDirection::Outbound => NET_FW_RULE_DIR_OUT,
@@ -1669,6 +2568,9 @@ mod tests {
             created_at: 0,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let params = FirewallRuleParams::from_app_rule(&inbound_rule);
         assert_eq!(params.name, "its.fw: node.exe [In:Allow:LAN]");
@@ -1688,6 +2590,9 @@ mod tests {
             created_at: 0,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let svc_params = FirewallRuleParams::from_app_rule(&svc_rule);
         assert_eq!(
@@ -1717,6 +2622,9 @@ mod tests {
             created_at: 1730000000,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
 
         let params = FirewallRuleParams::from_app_rule(&rule);
@@ -1756,6 +2664,9 @@ mod tests {
             created_at: 0,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
         assert_eq!(params.remote_addresses, "any");
@@ -1888,6 +2799,9 @@ Ok.
             created_at: 0,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -1941,6 +2855,9 @@ Ok.
             created_at: 0,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -1990,6 +2907,9 @@ Ok.
             created_at: 0,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -2042,6 +2962,9 @@ Ok.
             created_at: 0,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -2099,6 +3022,9 @@ Ok.
             created_at: 0,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
 
@@ -2264,6 +3190,9 @@ Action:                               Block
             created_at: 100,
             duration: crate::core::rules::RuleDuration::Minutes5,
             expires_at: Some(400),
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         let params = FirewallRuleParams::from_app_rule(&rule);
         assert_eq!(params.name, "its.fw: installer.exe [Allow:All] [TTL]");
@@ -2272,5 +3201,59 @@ Action:                               Block
         rule.expires_at = None;
         let perm_params = FirewallRuleParams::from_app_rule(&rule);
         assert_eq!(perm_params.name, "its.fw: installer.exe [Allow:All]");
+    }
+
+    #[test]
+    fn test_parse_registry_rule_entry_hyperv_port_and_uwp() {
+        let hv_raw = "v2.33|Name=kbot dev tcp|Dir=In|VMCreatorId={40E0AC32-46A5-438A-A0B2-2B479E8F2E90}|Protocol=6|RA4=192.168.128.0/255.255.252.0|LPort=5300|LPort=443|LPort=6443|Action=Allow|Active=TRUE|";
+        let hv_rule = parse_registry_rule_entry("kbot-dev-tcp", hv_raw, true)
+            .expect("should parse Hyper-V rule");
+        assert_eq!(hv_rule.app_path, "wsl://kbot-dev-tcp");
+        assert_eq!(hv_rule.display_name.as_deref(), Some("[WSL] kbot dev tcp"));
+        assert_eq!(hv_rule.direction, RuleDirection::Inbound);
+        assert_eq!(hv_rule.action, RuleAction::Allow);
+        assert_eq!(hv_rule.protocol, NetProtocol::Tcp);
+        assert_eq!(hv_rule.ports, "5300,443,6443");
+        assert_eq!(
+            hv_rule.custom_remote_ip.as_deref(),
+            Some("192.168.128.0/22")
+        );
+        assert!(!hv_rule.is_system_or_uwp);
+
+        let port_raw = "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=6|LPort=8443|LPort=8080|RA4=172.16.117.0/255.255.255.0|RA4=172.16.113.0/255.255.255.0|IF={AD179937}|Name=home.lab boot server on ctl (WSL)|";
+        let port_rule = parse_registry_rule_entry("home-lab-boot", port_raw, false)
+            .expect("should parse port-only rule");
+        assert_eq!(port_rule.app_path, "port://home-lab-boot");
+        assert_eq!(
+            port_rule.display_name.as_deref(),
+            Some("[PORT] home.lab boot server on ctl (WSL)")
+        );
+        assert_eq!(port_rule.ports, "8443,8080");
+        assert_eq!(
+            port_rule.custom_remote_ip.as_deref(),
+            Some("172.16.117.0/24,172.16.113.0/24")
+        );
+        assert!(!port_rule.is_system_or_uwp);
+
+        let uwp_raw = "v2.33|Action=Allow|Active=TRUE|Dir=Out|Profile=Domain|Profile=Private|Profile=Public|Name=Microsoft Store|Desc=Microsoft Store|PFN=Microsoft.WindowsStore_8wekyb3d8bbwe|";
+        let uwp_rule =
+            parse_registry_rule_entry("StoreRule", uwp_raw, false).expect("should parse UWP rule");
+        assert_eq!(
+            uwp_rule.app_path,
+            "uwp://Microsoft.WindowsStore_8wekyb3d8bbwe"
+        );
+        assert_eq!(
+            uwp_rule.display_name.as_deref(),
+            Some("[UWP] Microsoft Store")
+        );
+        assert!(uwp_rule.is_system_or_uwp);
+
+        let params = FirewallRuleParams::from_app_rule(&hv_rule);
+        let (rule_id, built_reg) = build_hyperv_registry_rule_string(&params);
+        assert_eq!(rule_id, "kbot-dev-tcp");
+        assert!(built_reg.contains("Protocol=6|"));
+        assert!(built_reg.contains("LPort=5300|LPort=443|LPort=6443|"));
+        assert!(built_reg.contains("RA4=192.168.128.0/255.255.252.0|"));
+        assert!(built_reg.contains("Name=kbot dev tcp|"));
     }
 }

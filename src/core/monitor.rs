@@ -43,6 +43,7 @@ pub struct AppActivitySummary {
     pub seen_ports: BTreeSet<u16>,
     pub seen_protocols: BTreeSet<String>,
     pub recent_events: Vec<NetworkEvent>,
+    pub is_system_or_uwp: bool,
 }
 
 impl AppActivitySummary {
@@ -171,6 +172,12 @@ impl EventAggregator {
 
     pub fn sync_firewall_rules(&mut self, rules: &HashMap<String, crate::core::rules::AppRule>) {
         self.blocked_paths_or_names.clear();
+        self.apps.retain(|k, summary| {
+            crate::core::rules::RuleTargetKind::from_app_path(&summary.app_path)
+                == crate::core::rules::RuleTargetKind::App
+                || summary.total_hits > 0
+                || rules.contains_key(k)
+        });
 
         for (key, rule) in rules {
             let base_filename = rule
@@ -181,11 +188,15 @@ impl EventAggregator {
                 .unwrap_or(&rule.app_path)
                 .to_string();
 
-            let filename = match rule.service_name.as_deref() {
-                Some(svc) if !svc.trim().is_empty() => {
-                    format!("{} [{}]", base_filename, svc.trim())
+            let filename = if let Some(ref dn) = rule.display_name {
+                dn.clone()
+            } else {
+                match rule.service_name.as_deref() {
+                    Some(svc) if !svc.trim().is_empty() => {
+                        format!("{} [{}]", base_filename, svc.trim())
+                    }
+                    _ => base_filename,
                 }
-                _ => base_filename,
             };
 
             let is_blocked = rule.action == crate::core::rules::RuleAction::Block;
@@ -199,7 +210,7 @@ impl EventAggregator {
                 .entry(key.to_lowercase())
                 .or_insert_with(|| AppActivitySummary {
                     app_path: rule.app_path.clone(),
-                    app_name: filename,
+                    app_name: filename.clone(),
                     service_name: rule.service_name.clone(),
                     direction: rule.direction,
                     process_id: 0,
@@ -226,11 +237,32 @@ impl EventAggregator {
                     seen_ports: BTreeSet::new(),
                     seen_protocols: BTreeSet::new(),
                     recent_events: Vec::new(),
+                    is_system_or_uwp: rule.is_system_or_uwp,
                 });
             entry.is_knocking = is_blocked;
             entry.direction = rule.direction;
+            entry.is_system_or_uwp = rule.is_system_or_uwp;
+            if rule.display_name.is_some() {
+                entry.app_name = filename;
+            }
             if entry.service_name.is_none() && rule.service_name.is_some() {
                 entry.service_name = rule.service_name.clone();
+            }
+            for token in rule.ports.split(',').map(str::trim) {
+                if let Ok(p) = token.parse::<u16>() {
+                    if p > 0 {
+                        entry.seen_ports.insert(p);
+                    }
+                }
+            }
+            match rule.protocol {
+                crate::core::rules::NetProtocol::Tcp => {
+                    entry.seen_protocols.insert("TCP".into());
+                }
+                crate::core::rules::NetProtocol::Udp => {
+                    entry.seen_protocols.insert("UDP".into());
+                }
+                crate::core::rules::NetProtocol::Any => {}
             }
         }
     }
@@ -283,6 +315,7 @@ impl EventAggregator {
                         seen_ports: BTreeSet::new(),
                         seen_protocols: BTreeSet::new(),
                         recent_events: Vec::new(),
+                        is_system_or_uwp: false,
                     }
                 });
             }
@@ -296,24 +329,68 @@ impl EventAggregator {
     }
 
     pub fn record_event(&mut self, event: NetworkEvent) {
-        let base_name = event
+        let is_wsl_knock = event
             .app_path
-            .rsplit(['\\', '/'])
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("unknown.exe")
-            .to_string();
+            .to_ascii_lowercase()
+            .starts_with("wsl://knock/");
 
-        let app_name = match event.service_name {
-            Some(ref s) if !s.trim().is_empty() => format!("{} [{}]", base_name, s.trim()),
-            _ => base_name.clone(),
+        let (key, base_name, app_name) = if is_wsl_knock {
+            let ev_proto_upper = event.protocol.to_uppercase();
+            let matching_wsl_key = self
+                .apps
+                .iter()
+                .find(|(_, summary)| {
+                    crate::core::rules::RuleTargetKind::from_app_path(&summary.app_path)
+                        == crate::core::rules::RuleTargetKind::HyperV
+                        && !summary
+                            .app_path
+                            .to_ascii_lowercase()
+                            .starts_with("wsl://knock/")
+                        && summary.direction == event.direction
+                        && (summary.seen_ports.contains(&event.remote_port)
+                            || summary.last_target_port == event.remote_port)
+                        && (summary.seen_protocols.is_empty()
+                            || summary.seen_protocols.contains(&ev_proto_upper))
+                })
+                .map(|(k, s)| (k.clone(), s.app_name.clone()));
+
+            if let Some((existing_key, existing_name)) = matching_wsl_key {
+                (existing_key, existing_name.clone(), existing_name)
+            } else {
+                let k = crate::core::rules::make_app_key(
+                    &event.app_path,
+                    event.service_name.as_deref(),
+                    event.direction,
+                );
+                let name = format!(
+                    "[WSL] {} :{}/{}",
+                    event.direction.label(),
+                    event.remote_port,
+                    event.protocol.to_uppercase()
+                );
+                (k, name.clone(), name)
+            }
+        } else {
+            let base = event
+                .app_path
+                .rsplit(['\\', '/'])
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown.exe")
+                .to_string();
+
+            let display = match event.service_name {
+                Some(ref s) if !s.trim().is_empty() => format!("{} [{}]", base, s.trim()),
+                _ => base.clone(),
+            };
+            let k = crate::core::rules::make_app_key(
+                &event.app_path,
+                event.service_name.as_deref(),
+                event.direction,
+            );
+            (k, base, display)
         };
 
-        let key = crate::core::rules::make_app_key(
-            &event.app_path,
-            event.service_name.as_deref(),
-            event.direction,
-        );
         let is_fw_blocked = self.is_app_blocked(&event.app_path, &base_name)
             || self.blocked_paths_or_names.contains(&key.to_lowercase());
 
@@ -339,6 +416,7 @@ impl EventAggregator {
             seen_ports: BTreeSet::new(),
             seen_protocols: BTreeSet::new(),
             recent_events: Vec::new(),
+            is_system_or_uwp: false,
         });
 
         entry.total_hits += 1;
@@ -645,6 +723,9 @@ mod tests {
                 created_at: 1,
                 duration: crate::core::rules::RuleDuration::Permanent,
                 expires_at: None,
+                display_name: None,
+                rule_id: None,
+                is_system_or_uwp: false,
             },
         );
 
@@ -663,6 +744,9 @@ mod tests {
                 created_at: 2,
                 duration: crate::core::rules::RuleDuration::Permanent,
                 expires_at: None,
+                display_name: None,
+                rule_id: None,
+                is_system_or_uwp: false,
             },
         );
 
@@ -704,6 +788,7 @@ mod tests {
             seen_ports: BTreeSet::new(),
             seen_protocols: BTreeSet::new(),
             recent_events: Vec::new(),
+            is_system_or_uwp: false,
         };
 
         // Без подій
@@ -902,6 +987,7 @@ mod tests {
             seen_ports: BTreeSet::new(),
             seen_protocols: BTreeSet::new(),
             recent_events: Vec::new(),
+            is_system_or_uwp: false,
         };
 
         assert_eq!(summary.traffic_transfer_display(), "-");
@@ -930,5 +1016,75 @@ mod tests {
         assert_eq!(s2.total_packets, 15);
         assert_eq!(s2.traffic_transfer_display(), "3.0 KB");
         assert_eq!(s2.packets_per_sec_display(), "0 p/s");
+    }
+
+    #[test]
+    fn test_wsl_knock_routing_and_sync_firewall_rules_ports() {
+        let mut agg = EventAggregator::new();
+        let mut rules = HashMap::new();
+        rules.insert(
+            "in::wsl://kbot-dev-tcp".to_string(),
+            crate::core::rules::AppRule {
+                app_path: "wsl://kbot-dev-tcp".into(),
+                service_name: None,
+                direction: crate::core::rules::RuleDirection::Inbound,
+                action: crate::core::rules::RuleAction::Allow,
+                zone_scope: crate::core::rules::AllowedZoneScope::Both,
+                custom_remote_ip: Some("192.168.128.0/22".into()),
+                protocol: crate::core::rules::NetProtocol::Tcp,
+                ports: "5300,443".into(),
+                interface_name: None,
+                created_at: 0,
+                duration: crate::core::rules::RuleDuration::Permanent,
+                expires_at: None,
+                display_name: Some("[WSL] kbot dev tcp".into()),
+                rule_id: Some("kbot-dev-tcp".into()),
+                is_system_or_uwp: false,
+            },
+        );
+
+        agg.sync_firewall_rules(&rules);
+        let kbot = agg.apps.get("in::wsl://kbot-dev-tcp").unwrap();
+        assert_eq!(kbot.app_name, "[WSL] kbot dev tcp");
+        assert!(kbot.seen_ports.contains(&5300));
+        assert!(kbot.seen_ports.contains(&443));
+
+        // Knock on configured WSL port 5300 attaches to existing [WSL] kbot dev tcp rule
+        agg.record_event(NetworkEvent {
+            timestamp: 100,
+            app_path: "wsl://knock/tcp/5300".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Inbound,
+            process_id: 0,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("8.8.8.8").unwrap(),
+            remote_port: 5300,
+            protocol: "TCP".into(),
+            is_blocked: true,
+            zone: Zone::Internet,
+        });
+        assert_eq!(agg.apps.len(), 1);
+        assert_eq!(
+            agg.apps.get("in::wsl://kbot-dev-tcp").unwrap().total_hits,
+            1
+        );
+
+        // Knock on unconfigured WSL port 9090 creates dedicated [WSL] Inbound :9090/TCP entry
+        agg.record_event(NetworkEvent {
+            timestamp: 101,
+            app_path: "wsl://knock/tcp/9090".into(),
+            service_name: None,
+            direction: crate::core::rules::RuleDirection::Inbound,
+            process_id: 0,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("192.168.1.50").unwrap(),
+            remote_port: 9090,
+            protocol: "TCP".into(),
+            is_blocked: true,
+            zone: Zone::Lan,
+        });
+        let unconf = agg.apps.get("in::wsl://knock/tcp/9090").unwrap();
+        assert_eq!(unconf.app_name, "[WSL] Inbound :9090/TCP");
+        assert!(unconf.is_knocking);
     }
 }

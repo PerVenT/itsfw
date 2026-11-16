@@ -417,6 +417,15 @@ pub fn decode_wfp_app_id_utf16(bytes: &[u8]) -> Option<String> {
     }
 }
 
+pub fn is_hyperv_wfp_filter_name(meta: &str) -> bool {
+    let lower = meta.to_ascii_lowercase();
+    lower.contains("mpssvc default rule")
+        || lower.contains("40e0ac32")
+        || lower.contains("hyper-v")
+        || lower.contains("hyperv")
+        || lower.contains("wsl")
+}
+
 /// Монітор відхилених з'єднань (Dropped TCP SYN / UDP) через Windows Filtering Platform (FwpmNetEventEnum1).
 pub struct WfpDropMonitor {
     #[cfg(windows)]
@@ -425,6 +434,8 @@ pub struct WfpDropMonitor {
     last_poll_filetime: u64,
     #[cfg(windows)]
     dos_device_map: HashMap<String, String>,
+    #[cfg(windows)]
+    filter_name_cache: HashMap<u64, String>,
 }
 
 #[cfg(windows)]
@@ -495,6 +506,7 @@ impl WfpDropMonitor {
             engine_handle: opened,
             last_poll_filetime: start_u64,
             dos_device_map,
+            filter_name_cache: HashMap::new(),
         }
     }
 
@@ -566,8 +578,9 @@ impl WfpDropMonitor {
                         continue;
                     }
 
-                    // Визначаємо напрямок трафіку: Outbound або Inbound
+                    // Визначаємо напрямок трафіку: Outbound або Inbound, та filterId
                     let mut direction = crate::core::rules::RuleDirection::Outbound;
+                    let mut filter_id = 0u64;
                     if ev.r#type == FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
                         let drop_ptr = ev.Anonymous.classifyDrop;
                         if !drop_ptr.is_null() {
@@ -575,6 +588,7 @@ impl WfpDropMonitor {
                             if drop_info.isLoopback.as_bool() {
                                 continue;
                             }
+                            filter_id = drop_info.filterId;
                             // FWP_DIRECTION_OUTBOUND = 0, MS_FWP_DIRECTION_OUT = 0x3901 (14593)
                             // FWP_DIRECTION_INBOUND = 1, MS_FWP_DIRECTION_IN = 0x3900 (14592)
                             let dir = drop_info.msFwpDirection;
@@ -587,20 +601,6 @@ impl WfpDropMonitor {
                             }
                         }
                     }
-
-                    // Витягуємо шлях додатку з header.appId
-                    let blob = ev.header.appId;
-                    if blob.size == 0 || blob.data.is_null() {
-                        continue;
-                    }
-                    let raw_bytes = std::slice::from_raw_parts(blob.data, blob.size as usize);
-                    let Some(nt_path) = decode_wfp_app_id_utf16(raw_bytes) else {
-                        continue;
-                    };
-                    let app_path = crate::core::interfaces::normalize_nt_device_path(
-                        &nt_path,
-                        &self.dos_device_map,
-                    );
 
                     // Витягуємо протокол, IP та порт призначення
                     let protocol = match ev.header.ipProtocol {
@@ -632,13 +632,93 @@ impl WfpDropMonitor {
                         continue;
                     }
 
-                    let (final_path, final_pid) = if direction
-                        == crate::core::rules::RuleDirection::Inbound
-                    {
-                        let listeners = listeners_cache.get_or_insert_with(scan_listening_sockets);
-                        attribute_inbound_drop_to_listener(&app_path, port, &protocol, listeners)
+                    // Визначаємо, чи належить WFP-фільтр до Hyper-V / WSL
+                    let is_hyperv_filter = if filter_id > 0 {
+                        let meta = if let Some(cached) = self.filter_name_cache.get(&filter_id) {
+                            cached.clone()
+                        } else {
+                            use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
+                                FwpmFilterGetById0, FWPM_FILTER0,
+                            };
+                            let mut filter_ptr: *mut FWPM_FILTER0 = std::ptr::null_mut();
+                            let mut combined = String::new();
+                            if FwpmFilterGetById0(engine, filter_id, &mut filter_ptr) == 0
+                                && !filter_ptr.is_null()
+                            {
+                                let fname = if !(*filter_ptr).displayData.name.is_null() {
+                                    (*filter_ptr)
+                                        .displayData
+                                        .name
+                                        .to_string()
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                let fdesc = if !(*filter_ptr).displayData.description.is_null() {
+                                    (*filter_ptr)
+                                        .displayData
+                                        .description
+                                        .to_string()
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                combined = format!("{} {}", fname, fdesc);
+                                let mut raw_f = filter_ptr as *mut core::ffi::c_void;
+                                FwpmFreeMemory0(&mut raw_f);
+                            }
+                            self.filter_name_cache.insert(filter_id, combined.clone());
+                            combined
+                        };
+                        is_hyperv_wfp_filter_name(&meta)
                     } else {
-                        (app_path, 0)
+                        false
+                    };
+
+                    // Витягуємо шлях додатку з header.appId (може бути порожнім для Hyper-V / WSL)
+                    let blob = ev.header.appId;
+                    let app_id_path = if blob.size > 0 && !blob.data.is_null() {
+                        let raw_bytes = std::slice::from_raw_parts(blob.data, blob.size as usize);
+                        decode_wfp_app_id_utf16(raw_bytes).map(|nt_path| {
+                            crate::core::interfaces::normalize_nt_device_path(
+                                &nt_path,
+                                &self.dos_device_map,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+
+                    let (final_path, final_pid) = match app_id_path {
+                        Some(app_path) => {
+                            let listeners =
+                                listeners_cache.get_or_insert_with(scan_listening_sockets);
+                            let has_host_listener = listeners.iter().any(|l| {
+                                l.port == port && l.protocol.eq_ignore_ascii_case(&protocol)
+                            });
+                            if is_hyperv_filter && !has_host_listener {
+                                (
+                                    format!("wsl://knock/{}/{}", protocol.to_lowercase(), port),
+                                    0,
+                                )
+                            } else if direction == crate::core::rules::RuleDirection::Inbound {
+                                attribute_inbound_drop_to_listener(
+                                    &app_path, port, &protocol, listeners,
+                                )
+                            } else {
+                                (app_path, 0)
+                            }
+                        }
+                        None => {
+                            if is_hyperv_filter || port > 0 {
+                                (
+                                    format!("wsl://knock/{}/{}", protocol.to_lowercase(), port),
+                                    0,
+                                )
+                            } else {
+                                continue;
+                            }
+                        }
                     };
 
                     let mut service_name = None;
@@ -847,5 +927,16 @@ mod tests {
             lookup_loopback_peer(9146, "tcp"),
             Some("-> language_server.exe".into())
         );
+    }
+
+    #[test]
+    fn test_is_hyperv_wfp_filter_name_detection() {
+        assert!(is_hyperv_wfp_filter_name(
+            "MPSSVC_DEFAULT_RULE_INBOUND_PUBLIC_{40E0AC32-46A5-438A-A0B2-2B479E8F2E90} MPSSVC Default Rule"
+        ));
+        assert!(is_hyperv_wfp_filter_name("Hyper-V vSwitch Inbound Block"));
+        assert!(!is_hyperv_wfp_filter_name(
+            "it's.fw: chrome.exe [Block:All]"
+        ));
     }
 }

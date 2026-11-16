@@ -79,6 +79,30 @@ impl RuleDuration {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RuleTargetKind {
+    #[default]
+    App,
+    PortRule,
+    HyperV,
+    Uwp,
+}
+
+impl RuleTargetKind {
+    pub fn from_app_path(path: &str) -> Self {
+        let lower = path.trim().to_ascii_lowercase();
+        if lower.starts_with("wsl://") {
+            RuleTargetKind::HyperV
+        } else if lower.starts_with("port://") {
+            RuleTargetKind::PortRule
+        } else if lower.starts_with("uwp://") {
+            RuleTargetKind::Uwp
+        } else {
+            RuleTargetKind::App
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRule {
     pub app_path: String,
@@ -98,6 +122,12 @@ pub struct AppRule {
     pub duration: RuleDuration,
     #[serde(default)]
     pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub is_system_or_uwp: bool,
 }
 
 impl AppRule {
@@ -204,6 +234,72 @@ pub fn validate_ports_spec(spec: &str, protocol: NetProtocol) -> Result<String, 
     Ok(validated_tokens.join(","))
 }
 
+pub fn ipv4_mask_to_prefix(mask: std::net::Ipv4Addr) -> Option<u8> {
+    let bits = u32::from(mask);
+    if bits == 0 {
+        return Some(0);
+    }
+    let inv = !bits;
+    if inv & inv.wrapping_add(1) != 0 {
+        return None;
+    }
+    Some(bits.leading_ones() as u8)
+}
+
+pub fn normalize_registry_ra4(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((ip_part, mask_part)) = trimmed.split_once('/') {
+        let ip: std::net::IpAddr = ip_part.trim().parse().ok()?;
+        let mask_str = mask_part.trim();
+        if let Ok(prefix) = mask_str.parse::<u8>() {
+            match ip {
+                std::net::IpAddr::V4(_) if prefix <= 32 => {
+                    return Some(format!("{}/{}", ip, prefix))
+                }
+                std::net::IpAddr::V6(_) if prefix <= 128 => {
+                    return Some(format!("{}/{}", ip, prefix))
+                }
+                _ => return None,
+            }
+        } else if let (std::net::IpAddr::V4(v4), Ok(mask_v4)) =
+            (ip, mask_str.parse::<std::net::Ipv4Addr>())
+        {
+            let prefix = ipv4_mask_to_prefix(mask_v4)?;
+            return Some(format!("{}/{}", v4, prefix));
+        }
+        None
+    } else {
+        let ip: std::net::IpAddr = trimmed.parse().ok()?;
+        Some(ip.to_string())
+    }
+}
+
+pub fn cidr_to_dotted_mask(spec: &str) -> String {
+    spec.split(',')
+        .map(|token| {
+            let t = token.trim();
+            if let Some((ip_part, pfx_part)) = t.split_once('/') {
+                if let (Ok(v4), Ok(pfx)) = (
+                    ip_part.trim().parse::<std::net::Ipv4Addr>(),
+                    pfx_part.trim().parse::<u8>(),
+                ) {
+                    if pfx <= 32 {
+                        let mask_u32 = if pfx == 0 { 0 } else { !0u32 << (32 - pfx) };
+                        let mask = std::net::Ipv4Addr::from(mask_u32);
+                        return format!("{}/{}", v4, mask);
+                    }
+                }
+            }
+            t.to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub fn validate_ip_or_cidr_spec(spec: &str) -> Result<String, String> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
@@ -231,23 +327,34 @@ pub fn validate_ip_or_cidr_spec(spec: &str) -> Result<String, String> {
             let ip = parts[0]
                 .parse::<std::net::IpAddr>()
                 .map_err(|_| format!("Invalid IP address in CIDR: '{}'", parts[0]))?;
-            let prefix = parts[1]
-                .parse::<u8>()
-                .map_err(|_| format!("Invalid prefix length in CIDR: '{}'", parts[1]))?;
+            let mask_str = parts[1];
 
-            match ip {
-                std::net::IpAddr::V4(_) => {
-                    if prefix > 32 {
-                        return Err(format!("IPv4 CIDR prefix must be 0..=32, got {}", prefix));
+            if let Ok(prefix) = mask_str.parse::<u8>() {
+                match ip {
+                    std::net::IpAddr::V4(_) => {
+                        if prefix > 32 {
+                            return Err(format!("IPv4 CIDR prefix must be 0..=32, got {}", prefix));
+                        }
+                    }
+                    std::net::IpAddr::V6(_) => {
+                        if prefix > 128 {
+                            return Err(format!(
+                                "IPv6 CIDR prefix must be 0..=128, got {}",
+                                prefix
+                            ));
+                        }
                     }
                 }
-                std::net::IpAddr::V6(_) => {
-                    if prefix > 128 {
-                        return Err(format!("IPv6 CIDR prefix must be 0..=128, got {}", prefix));
-                    }
-                }
+                validated_tokens.push(format!("{}/{}", ip, prefix));
+            } else if let (std::net::IpAddr::V4(v4), Ok(mask_v4)) =
+                (ip, mask_str.parse::<std::net::Ipv4Addr>())
+            {
+                let prefix = ipv4_mask_to_prefix(mask_v4)
+                    .ok_or_else(|| format!("Invalid subnet mask in CIDR: '{}'", mask_str))?;
+                validated_tokens.push(format!("{}/{}", v4, prefix));
+            } else {
+                return Err(format!("Invalid prefix length in CIDR: '{}'", mask_str));
             }
-            validated_tokens.push(format!("{}/{}", ip, prefix));
         } else {
             let ip = token
                 .parse::<std::net::IpAddr>()
@@ -436,6 +543,9 @@ mod tests {
             created_at: 1000,
             duration: RuleDuration::Minutes15,
             expires_at: Some(1900),
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
         assert!(rule.is_temporary());
         assert!(!rule.is_expired(1899));
@@ -448,5 +558,39 @@ mod tests {
         assert!(rule.is_temporary());
         assert!(!rule.is_expired(999999));
         assert_eq!(rule.remaining_display(5000), Some("⏳ exit".into()));
+    }
+
+    #[test]
+    fn test_rule_target_kind_and_dotted_mask_validation() {
+        assert_eq!(
+            RuleTargetKind::from_app_path(r"C:\App\curl.exe"),
+            RuleTargetKind::App
+        );
+        assert_eq!(
+            RuleTargetKind::from_app_path("wsl://kbot-dev-tcp"),
+            RuleTargetKind::HyperV
+        );
+        assert_eq!(
+            RuleTargetKind::from_app_path("PORT://{5A0F845C}"),
+            RuleTargetKind::PortRule
+        );
+        assert_eq!(
+            RuleTargetKind::from_app_path("uwp://Microsoft.WindowsStore_8wekyb3d8bbwe"),
+            RuleTargetKind::Uwp
+        );
+
+        assert_eq!(
+            validate_ip_or_cidr_spec("172.16.117.0/255.255.255.0, 192.168.128.0/22").unwrap(),
+            "172.16.117.0/24,192.168.128.0/22"
+        );
+        assert_eq!(
+            normalize_registry_ra4("192.168.128.0/255.255.252.0"),
+            Some("192.168.128.0/22".to_string())
+        );
+        assert_eq!(
+            cidr_to_dotted_mask("172.16.117.0/24,192.168.128.0/22"),
+            "172.16.117.0/255.255.255.0,192.168.128.0/255.255.252.0"
+        );
+        assert!(validate_ip_or_cidr_spec("10.0.0.0/255.0.255.0").is_err());
     }
 }
