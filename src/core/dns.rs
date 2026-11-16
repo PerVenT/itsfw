@@ -2,14 +2,36 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
+fn is_reverse_lookup_domain(domain: &str) -> bool {
+    let lower = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    lower.ends_with(".in-addr.arpa") || lower.ends_with(".ip6.arpa")
+}
+
 pub fn parse_ipconfig_displaydns(text: &str) -> HashMap<IpAddr, String> {
     let mut map = HashMap::new();
-    let mut current_name: Option<String> = None;
+    let mut section_domain: Option<String> = None;
+    let mut current_record_name: Option<String> = None;
+    let mut prev_non_empty_line: Option<String> = None;
 
     for line in text.lines() {
         let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
         if trimmed.starts_with("---") {
-            current_name = None;
+            current_record_name = None;
+            section_domain = prev_non_empty_line
+                .as_deref()
+                .map(|s| s.trim_end_matches('.').trim())
+                .filter(|s| {
+                    !s.is_empty()
+                        && !s.contains(' ')
+                        && !s.contains(':')
+                        && !is_reverse_lookup_domain(s)
+                })
+                .map(str::to_string);
+            prev_non_empty_line = None;
             continue;
         }
 
@@ -17,18 +39,29 @@ pub fn parse_ipconfig_displaydns(text: &str) -> HashMap<IpAddr, String> {
             let key = key_part.trim().to_lowercase();
             let val = val_part.trim();
 
-            if key.contains("record name") || key.contains("имя записи") {
+            if key.contains("record name")
+                || key.contains("имя записи")
+                || key.contains("ім'я запису")
+            {
                 let domain = val.trim_end_matches('.').trim().to_string();
-                if !domain.is_empty() {
-                    current_name = Some(domain);
+                if !domain.is_empty() && !is_reverse_lookup_domain(&domain) {
+                    if section_domain.is_none() {
+                        section_domain = Some(domain.clone());
+                    }
+                    current_record_name = Some(domain);
+                } else {
+                    current_record_name = None;
                 }
             } else if let Ok(ip) = val.parse::<IpAddr>() {
                 if !ip.is_loopback() && !ip.is_unspecified() {
-                    if let Some(ref name) = current_name {
+                    if let Some(name) = section_domain.as_ref().or(current_record_name.as_ref()) {
                         map.insert(ip, name.clone());
                     }
                 }
             }
+            prev_non_empty_line = None;
+        } else {
+            prev_non_empty_line = Some(trimmed.to_string());
         }
     }
 
@@ -51,6 +84,7 @@ pub fn format_recent_activity_endpoint(
 #[derive(Clone)]
 pub struct DnsResolver {
     cache: Arc<RwLock<HashMap<IpAddr, Option<String>>>>,
+    neg_cooldown: Arc<RwLock<HashMap<IpAddr, std::time::Instant>>>,
     req_tx: crossbeam_channel::Sender<IpAddr>,
 }
 
@@ -66,6 +100,7 @@ impl DnsResolver {
         std::mem::forget(req_rx);
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
+            neg_cooldown: Arc::new(RwLock::new(HashMap::new())),
             req_tx,
         }
     }
@@ -79,6 +114,14 @@ impl DnsResolver {
 
         if ip.is_loopback() || ip.is_unspecified() {
             return None;
+        }
+
+        if let Ok(neg) = self.neg_cooldown.read() {
+            if let Some(ts) = neg.get(&ip) {
+                if ts.elapsed() < std::time::Duration::from_secs(5) {
+                    return None;
+                }
+            }
         }
 
         if let Ok(mut cache) = self.cache.write() {
@@ -111,6 +154,7 @@ impl DnsResolver {
         }
         let (req_tx, req_rx) = crossbeam_channel::bounded::<IpAddr>(256);
         let cache = Arc::new(RwLock::new(HashMap::new()));
+        let neg_cooldown = Arc::new(RwLock::new(HashMap::new()));
 
         let cache_prepop = Arc::clone(&cache);
         let _ = std::thread::Builder::new()
@@ -120,13 +164,18 @@ impl DnsResolver {
             });
 
         let cache_worker = Arc::clone(&cache);
+        let neg_worker = Arc::clone(&neg_cooldown);
         let _ = std::thread::Builder::new()
             .name("dns-rdns-worker".into())
             .spawn(move || {
-                rdns_worker_loop(req_rx, cache_worker);
+                rdns_worker_loop(req_rx, cache_worker, neg_worker);
             });
 
-        Self { cache, req_tx }
+        Self {
+            cache,
+            neg_cooldown,
+            req_tx,
+        }
     }
 }
 
@@ -145,7 +194,16 @@ fn prepopulate_os_dns_cache(cache: &Arc<RwLock<HashMap<IpAddr, Option<String>>>>
         let entries = parse_ipconfig_displaydns(&text);
         if let Ok(mut c) = cache.write() {
             for (ip, domain) in entries {
-                c.entry(ip).or_insert(Some(domain));
+                match c.entry(ip) {
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(Some(domain));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut o) => {
+                        if o.get().is_none() {
+                            *o.get_mut() = Some(domain);
+                        }
+                    }
+                }
             }
         }
     }
@@ -155,11 +213,55 @@ fn prepopulate_os_dns_cache(cache: &Arc<RwLock<HashMap<IpAddr, Option<String>>>>
 fn rdns_worker_loop(
     req_rx: crossbeam_channel::Receiver<IpAddr>,
     cache: Arc<RwLock<HashMap<IpAddr, Option<String>>>>,
+    neg_cooldown: Arc<RwLock<HashMap<IpAddr, std::time::Instant>>>,
 ) {
+    let mut last_os_cache_refresh: Option<std::time::Instant> = None;
+
     while let Ok(ip) = req_rx.recv() {
+        if let Ok(c) = cache.read() {
+            if matches!(c.get(&ip), Some(Some(_))) {
+                continue;
+            }
+        }
+
+        let should_refresh = last_os_cache_refresh
+            .map(|t| t.elapsed() >= std::time::Duration::from_millis(800))
+            .unwrap_or(true);
+        if should_refresh {
+            prepopulate_os_dns_cache(&cache);
+            last_os_cache_refresh = Some(std::time::Instant::now());
+        }
+
+        let found_in_forward_cache = cache
+            .read()
+            .ok()
+            .map(|c| matches!(c.get(&ip), Some(Some(_))))
+            .unwrap_or(false);
+        if found_in_forward_cache {
+            if let Ok(mut neg) = neg_cooldown.write() {
+                neg.remove(&ip);
+            }
+            continue;
+        }
+
         let resolved = reverse_dns_lookup(ip);
-        if let Ok(mut c) = cache.write() {
-            c.insert(ip, resolved);
+        match resolved {
+            Some(domain) => {
+                if let Ok(mut c) = cache.write() {
+                    c.insert(ip, Some(domain));
+                }
+                if let Ok(mut neg) = neg_cooldown.write() {
+                    neg.remove(&ip);
+                }
+            }
+            None => {
+                if let Ok(mut neg) = neg_cooldown.write() {
+                    neg.insert(ip, std::time::Instant::now());
+                }
+                if let Ok(mut c) = cache.write() {
+                    c.remove(&ip);
+                }
+            }
         }
     }
 }
@@ -277,13 +379,50 @@ Windows IP Configuration
         assert_eq!(
             map.get(&IpAddr::from_str("20.190.159.4").unwrap())
                 .map(|s| s.as_str()),
-            Some("v10.events.data.microsoft.com")
+            Some("telemetry.microsoft.com")
         );
         assert_eq!(
             map.get(&IpAddr::from_str("2a00:1450:4001:828::200e").unwrap())
                 .map(|s| s.as_str()),
             Some("ipv6.google.com")
         );
+    }
+
+    #[test]
+    fn test_parse_ipconfig_displaydns_preserves_original_domain_across_cname_chain() {
+        let sample = r#"
+Windows IP Configuration
+
+    193.118.16.172.in-addr.arpa.
+    ----------------------------------------
+    Record Name . . . . . : 193.118.16.172.in-addr.arpa.
+    Record Type . . . . . : 12
+    PTR Record  . . . . . : vpn.pervent.dev
+
+    sso.demo.pervent.dev
+    ----------------------------------------
+    Record Name . . . . . : sso.demo.pervent.dev
+    Record Type . . . . . : 5
+    Time To Live  . . . . : 0
+    Data Length . . . . . : 8
+    Section . . . . . . . : Answer
+    CNAME Record  . . . . : vpn.demo.pervent.dev
+
+
+    Record Name . . . . . : vpn.demo.pervent.dev
+    Record Type . . . . . : 1
+    Time To Live  . . . . : 0
+    Data Length . . . . . : 4
+    Section . . . . . . . : Answer
+    A (Host) Record . . . : 172.16.114.193
+"#;
+        let map = parse_ipconfig_displaydns(sample);
+        assert_eq!(
+            map.get(&IpAddr::from_str("172.16.114.193").unwrap())
+                .map(|s| s.as_str()),
+            Some("sso.demo.pervent.dev")
+        );
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
