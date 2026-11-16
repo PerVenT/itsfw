@@ -274,8 +274,11 @@ where
                             app.editor_cycle_option(true);
                         }
                         KeyCode::Char(' ') => match app.edit_focused_field {
-                            crate::tui::app::RuleEditorField::CustomIp
-                            | crate::tui::app::RuleEditorField::Ports => {}
+                            crate::tui::app::RuleEditorField::RuleName
+                            | crate::tui::app::RuleEditorField::CustomIp
+                            | crate::tui::app::RuleEditorField::Ports => {
+                                app.editor_input_char(' ');
+                            }
                             _ => {
                                 app.editor_cycle_option(true);
                             }
@@ -384,35 +387,63 @@ where
                 }
 
                 if app.active_pane == crate::tui::app::ActivePane::ProcessDetails {
-                    match key.code {
-                        KeyCode::Esc => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Esc, _) => {
                             app.active_pane = crate::tui::app::ActivePane::Applications;
                             continue;
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
+                        (KeyCode::Enter, m) | (KeyCode::Char('j'), m)
+                            if m.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            app.execute_details_ctrl_enter_action();
+                            continue;
+                        }
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
                             app.details_prev_field();
                             continue;
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
                             app.details_next_field();
                             continue;
                         }
-                        KeyCode::Enter
-                            if app.details_focused_field
-                                == crate::tui::app::ProcessDetailsField::Args =>
-                        {
-                            app.open_args_modal();
+                        (KeyCode::Enter, _) => {
+                            app.execute_details_enter_action();
                             continue;
                         }
                         _ => {}
                     }
                 }
 
-                if app.active_pane == crate::tui::app::ActivePane::RecentActivity
-                    && key.code == KeyCode::Esc
-                {
-                    app.active_pane = crate::tui::app::ActivePane::Applications;
-                    continue;
+                if app.active_pane == crate::tui::app::ActivePane::RecentActivity {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Esc, _) => {
+                            app.active_pane = crate::tui::app::ActivePane::Applications;
+                            continue;
+                        }
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                            app.recent_prev_item();
+                            continue;
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                            app.recent_next_item();
+                            continue;
+                        }
+                        (KeyCode::Enter, m)
+                            if m.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            app.open_rule_editor_from_recent_event();
+                            continue;
+                        }
+                        (KeyCode::Enter, _) => {
+                            app.copy_selected_recent_activity();
+                            continue;
+                        }
+                        (KeyCode::Char('e'), _) => {
+                            app.open_rule_editor_from_recent_event();
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
 
                 // Отримуємо поточний вибраний додаток із ВІДФІЛЬТРОВАНОГО списку
@@ -494,6 +525,12 @@ where
                     }
                     KeyCode::Char('s') => {
                         app.toggle_sort_menu();
+                    }
+                    KeyCode::Char('u') | KeyCode::Char('U') => {
+                        app.toggle_system_uwp();
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        app.open_new_rule_editor();
                     }
                     KeyCode::Char('r') => {
                         app.firewall_active = crate::core::firewall::WindowsFirewallManager::is_outbound_policy_blocking();

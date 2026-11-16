@@ -206,12 +206,24 @@ impl SortMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorTargetOption {
+    #[default]
+    App,
+    PortRule,
+    HyperV,
+    BothWinAndHyperV,
+    Uwp,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleEditorField {
+    TargetKind,  // [App (.exe) | Port Rule | Hyper-V / WSL | Both | UWP]
+    RuleName,    // Editable name for PortRule / HyperV / Both
     Action,      // [Allow | Block]
     Direction,   // [Outbound | Inbound]
     Duration,    // [Permanent | 5m | 15m | 1h | Until Exit]
-    ZoneScope,   // [All (LAN+Inet) | LAN Only | Internet Only | Custom IP/CIDR]
+    ZoneScope,   // [All (LAN+WAN) | LAN Only | WAN Only | Custom IP]
     CustomIp,    // Editable string when ZoneScope == CustomIp
     Protocol,    // [TCP | UDP | Any]
     Ports,       // Editable string ("80,443", "8000-8080", "*") when Protocol != Any
@@ -226,6 +238,7 @@ pub struct App {
     pub current_filter: ViewFilter,
     pub active_pane: ActivePane,
     pub details_focused_field: ProcessDetailsField,
+    pub recent_selected_index: usize,
     pub args_modal_open: bool,
     pub args_modal_scroll: usize,
     pub sort_mode: SortMode,
@@ -234,6 +247,7 @@ pub struct App {
     pub sort_snapshot: std::collections::HashMap<String, AppSortMetrics>,
     pub selected_index: usize,
     pub selected_app_path: Option<String>,
+    pub show_system_uwp: bool,
     pub config: UserConfig,
     pub active_rules: std::collections::HashMap<String, AppRule>,
     pub aggregator: EventAggregator,
@@ -245,6 +259,9 @@ pub struct App {
     pub listening_selected_index: usize,
     pub listening_sockets: Vec<crate::core::scanner::ListeningSocketInfo>,
     pub edit_mode: bool,
+    pub edit_target_option: EditorTargetOption,
+    pub edit_rule_name: String,
+    pub edit_rule_id: Option<String>,
     pub edit_app_path: String,
     pub edit_remote_ip: Option<String>,
     pub edit_ports: String,
@@ -285,6 +302,7 @@ impl App {
             current_filter: ViewFilter::All,
             active_pane: ActivePane::Applications,
             details_focused_field: ProcessDetailsField::Policy,
+            recent_selected_index: 0,
             args_modal_open: false,
             args_modal_scroll: 0,
             sort_mode: SortMode::NameAsc,
@@ -293,6 +311,7 @@ impl App {
             sort_snapshot: std::collections::HashMap::new(),
             selected_index: 0,
             selected_app_path: None,
+            show_system_uwp: false,
             config,
             active_rules: std::collections::HashMap::new(),
             aggregator: EventAggregator::new(),
@@ -304,6 +323,9 @@ impl App {
             listening_selected_index: 0,
             listening_sockets: Vec::new(),
             edit_mode: false,
+            edit_target_option: EditorTargetOption::App,
+            edit_rule_name: String::new(),
+            edit_rule_id: None,
             edit_app_path: String::new(),
             edit_remote_ip: None,
             edit_ports: "80,443".into(),
@@ -328,12 +350,244 @@ impl App {
         }
     }
 
+    pub fn recent_visible_count(&self) -> usize {
+        self.visible_apps()
+            .get(self.selected_index)
+            .map(|a| a.recent_events.len().min(5))
+            .unwrap_or(0)
+    }
+
+    pub fn clamp_recent_selection(&mut self) {
+        let count = self.recent_visible_count();
+        if count == 0 {
+            self.recent_selected_index = 0;
+        } else if self.recent_selected_index >= count {
+            self.recent_selected_index = count - 1;
+        }
+    }
+
+    pub fn recent_next_item(&mut self) {
+        let count = self.recent_visible_count();
+        if count > 0 {
+            self.recent_selected_index = (self.recent_selected_index + 1) % count;
+        } else {
+            self.recent_selected_index = 0;
+        }
+    }
+
+    pub fn recent_prev_item(&mut self) {
+        let count = self.recent_visible_count();
+        if count > 0 {
+            if self.recent_selected_index == 0 {
+                self.recent_selected_index = count - 1;
+            } else {
+                self.recent_selected_index -= 1;
+            }
+        } else {
+            self.recent_selected_index = 0;
+        }
+    }
+
+    pub fn selected_recent_event(
+        &self,
+    ) -> Option<(String, Option<String>, crate::core::monitor::NetworkEvent)> {
+        let visible = self.visible_apps();
+        let app = visible.get(self.selected_index)?;
+        let ev = app
+            .recent_events
+            .iter()
+            .rev()
+            .take(5)
+            .nth(self.recent_selected_index)?
+            .clone();
+        Some((app.app_path.clone(), app.service_name.clone(), ev))
+    }
+
+    pub fn copy_selected_recent_activity(&mut self) {
+        let Some((_app_path, _svc, ev)) = self.selected_recent_event() else {
+            self.set_status("No recent activity event selected".into());
+            return;
+        };
+        let domain = self.dns_resolver.resolve_or_enqueue(ev.remote_ip);
+        let text = match domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(d) => format!(
+                "{}:{} {} ({})",
+                ev.remote_ip,
+                ev.remote_port,
+                ev.protocol.to_uppercase(),
+                d
+            ),
+            None => format!(
+                "{}:{} {}",
+                ev.remote_ip,
+                ev.remote_port,
+                ev.protocol.to_uppercase()
+            ),
+        };
+        if crate::core::process::copy_to_clipboard(&text) {
+            self.set_status("✓ Copied endpoint to clipboard!".into());
+        } else {
+            self.set_status("Failed to copy endpoint to clipboard".into());
+        }
+    }
+
+    pub fn open_rule_editor_from_recent_event(&mut self) {
+        let Some((app_path, _svc, ev)) = self.selected_recent_event() else {
+            return;
+        };
+        if !self.require_admin("Custom Rule Editor") {
+            return;
+        }
+        self.open_rule_editor_for_app(&app_path);
+        self.edit_custom_ip_mode = true;
+        self.edit_custom_ip = ev.remote_ip.to_string();
+        self.edit_remote_ip = Some(ev.remote_ip.to_string());
+        self.edit_ports = ev.remote_port.to_string();
+        self.edit_protocol = ev.protocol.to_uppercase();
+        self.edit_direction = ev.direction;
+        if app_path.to_ascii_lowercase().starts_with("wsl://") {
+            self.edit_target_option = EditorTargetOption::HyperV;
+        }
+    }
+
+    pub fn execute_details_enter_action(&mut self) {
+        let visible = self.visible_apps();
+        let Some(selected_app) = visible.get(self.selected_index).cloned() else {
+            return;
+        };
+        let target_kind = crate::core::rules::RuleTargetKind::from_app_path(&selected_app.app_path);
+        match self.details_focused_field {
+            ProcessDetailsField::Policy => {
+                self.open_rule_editor();
+            }
+            ProcessDetailsField::App => {
+                let text = if target_kind == crate::core::rules::RuleTargetKind::App {
+                    let parent = selected_app
+                        .parent_process_name
+                        .as_deref()
+                        .unwrap_or("Unknown");
+                    format!(
+                        "{} (PID: {} | Parent: {})",
+                        selected_app.app_name, selected_app.process_id, parent
+                    )
+                } else {
+                    selected_app.app_name.clone()
+                };
+                if crate::core::process::copy_to_clipboard(&text) {
+                    self.set_status("✓ Copied process info to clipboard!".into());
+                } else {
+                    self.set_status("Failed to copy process info to clipboard".into());
+                }
+            }
+            ProcessDetailsField::Desc => {
+                if target_kind == crate::core::rules::RuleTargetKind::App {
+                    let meta = self.get_or_load_metadata_with_pid(
+                        &selected_app.app_path,
+                        selected_app.process_id,
+                    );
+                    if let Some(desc) = meta.description.as_deref().filter(|s| !s.trim().is_empty())
+                    {
+                        if crate::core::process::copy_to_clipboard(desc) {
+                            self.set_status("✓ Copied description to clipboard!".into());
+                        } else {
+                            self.set_status("Failed to copy description to clipboard".into());
+                        }
+                    } else {
+                        self.set_status("No file description available to copy".into());
+                    }
+                } else {
+                    let text = format!(
+                        "{} {}",
+                        selected_app.protocols_display(),
+                        selected_app.all_ports_list()
+                    );
+                    if crate::core::process::copy_to_clipboard(&text) {
+                        self.set_status("✓ Copied description to clipboard!".into());
+                    }
+                }
+            }
+            ProcessDetailsField::Path => {
+                if crate::core::process::copy_to_clipboard(&selected_app.app_path) {
+                    self.set_status("✓ Copied path to clipboard!".into());
+                } else {
+                    self.set_status("Failed to copy path to clipboard".into());
+                }
+            }
+            ProcessDetailsField::Args => {
+                self.open_args_modal();
+            }
+        }
+    }
+
+    pub fn execute_details_ctrl_enter_action(&mut self) {
+        let visible = self.visible_apps();
+        let Some(selected_app) = visible.get(self.selected_index).cloned() else {
+            return;
+        };
+        let target_kind = crate::core::rules::RuleTargetKind::from_app_path(&selected_app.app_path);
+        match self.details_focused_field {
+            ProcessDetailsField::Policy => {
+                let composite_key = crate::core::rules::make_app_key(
+                    &selected_app.app_path,
+                    selected_app.service_name.as_deref(),
+                    selected_app.direction,
+                );
+                let rule_name = self
+                    .verified_fw_rules
+                    .get(&composite_key)
+                    .cloned()
+                    .or_else(|| {
+                        self.rule_for_app_entry(&selected_app).and_then(|r| {
+                            r.display_name
+                                .as_deref()
+                                .map(|s| {
+                                    s.strip_prefix("[WSL] ")
+                                        .or_else(|| s.strip_prefix("[PORT] "))
+                                        .or_else(|| s.strip_prefix("[UWP] "))
+                                        .unwrap_or(s)
+                                        .to_string()
+                                })
+                                .or_else(|| r.rule_id.clone())
+                        })
+                    })
+                    .unwrap_or_else(|| selected_app.app_name.clone());
+                let _ = crate::core::process::copy_to_clipboard(&rule_name);
+                #[cfg(windows)]
+                {
+                    if !cfg!(test) {
+                        let _ = std::process::Command::new("mmc.exe").arg("wf.msc").spawn();
+                    }
+                }
+                self.set_status("✓ Copied rule name & opened wf.msc!".into());
+            }
+            ProcessDetailsField::Path => {
+                if target_kind == crate::core::rules::RuleTargetKind::App {
+                    #[cfg(windows)]
+                    {
+                        if !cfg!(test) {
+                            use std::os::windows::process::CommandExt;
+                            let arg = format!("/select,\"{}\"", selected_app.app_path);
+                            let _ = std::process::Command::new("explorer.exe")
+                                .raw_arg(&arg)
+                                .spawn();
+                        }
+                    }
+                    self.set_status("✓ Opened folder in Explorer!".into());
+                } else {
+                    self.set_status("No local binary folder for rule-only entry".into());
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn cycle_active_pane(&mut self) {
         self.active_pane = match self.active_pane {
             ActivePane::Applications => ActivePane::ProcessDetails,
             ActivePane::ProcessDetails => ActivePane::RecentActivity,
             ActivePane::RecentActivity => ActivePane::Applications,
         };
+        self.clamp_recent_selection();
     }
 
     pub fn details_next_field(&mut self) {
@@ -696,6 +950,9 @@ impl App {
         let mut filtered: Vec<crate::core::monitor::AppActivitySummary> = all_apps
             .into_iter()
             .filter(|app_item| {
+                if app_item.is_system_or_uwp && !self.show_system_uwp {
+                    return false;
+                }
                 if app_item.direction != target_dir {
                     return false;
                 }
@@ -930,8 +1187,23 @@ impl App {
         }
         self.selected_index = 0;
         self.selected_app_path = None;
+        self.recent_selected_index = 0;
         self.sync_selection();
         self.set_status(format!("Filter: {}", name));
+    }
+
+    pub fn toggle_system_uwp(&mut self) {
+        self.show_system_uwp = !self.show_system_uwp;
+        self.selected_index = 0;
+        self.selected_app_path = None;
+        self.recent_selected_index = 0;
+        self.sync_selection();
+        let state = if self.show_system_uwp {
+            "VISIBLE"
+        } else {
+            "HIDDEN"
+        };
+        self.set_status(format!("System & UWP rules: {}", state));
     }
 
     pub fn current_palette(&self) -> ThemePalette {
@@ -950,6 +1222,7 @@ impl App {
     pub fn next_item(&mut self, total: usize) {
         if total > 0 {
             self.selected_index = (self.selected_index + 1) % total;
+            self.recent_selected_index = 0;
             let visible = self.visible_apps();
             if let Some(item) = visible.get(self.selected_index) {
                 self.selected_app_path = Some(item.app_path.clone());
@@ -964,6 +1237,7 @@ impl App {
             } else {
                 self.selected_index -= 1;
             }
+            self.recent_selected_index = 0;
             let visible = self.visible_apps();
             if let Some(item) = visible.get(self.selected_index) {
                 self.selected_app_path = Some(item.app_path.clone());
@@ -1035,9 +1309,37 @@ impl App {
         if let Some(app) = self.visible_apps().get(self.selected_index) {
             let path = app.app_path.clone();
             self.open_rule_editor_for_app(&path);
-        } else if self.require_admin("Custom Rule Editor") {
-            self.edit_mode = true;
+        } else {
+            self.open_new_rule_editor();
         }
+    }
+
+    pub fn open_new_rule_editor(&mut self) {
+        if !self.require_admin("New Firewall Rule") {
+            return;
+        }
+        let dir = match self.active_direction {
+            FirewallDirection::Outbound => RuleDirection::Outbound,
+            FirewallDirection::Inbound => RuleDirection::Inbound,
+        };
+        self.edit_mode = true;
+        self.edit_error = None;
+        self.edit_target_option = EditorTargetOption::HyperV;
+        self.edit_rule_name = String::new();
+        self.edit_rule_id = None;
+        self.edit_app_path = "wsl://new-rule".to_string();
+        self.edit_action = RuleAction::Allow;
+        self.edit_direction = dir;
+        self.edit_duration = crate::core::rules::RuleDuration::Permanent;
+        self.edit_zone_scope = AllowedZoneScope::Both;
+        self.edit_custom_ip_mode = false;
+        self.edit_custom_ip = String::new();
+        self.edit_remote_ip = None;
+        self.edit_protocol = "TCP".to_string();
+        self.edit_ports = "80,443".to_string();
+        self.edit_service_name = None;
+        self.edit_apply_to_service = false;
+        self.edit_focused_field = RuleEditorField::TargetKind;
     }
 
     pub fn open_rule_editor_for_app(&mut self, app_path: &str) {
@@ -1049,6 +1351,14 @@ impl App {
         self.edit_mode = true;
         self.edit_focused_field = RuleEditorField::Action;
         self.edit_error = None;
+
+        let target_kind = crate::core::rules::RuleTargetKind::from_app_path(app_path);
+        self.edit_target_option = match target_kind {
+            crate::core::rules::RuleTargetKind::App => EditorTargetOption::App,
+            crate::core::rules::RuleTargetKind::PortRule => EditorTargetOption::PortRule,
+            crate::core::rules::RuleTargetKind::HyperV => EditorTargetOption::HyperV,
+            crate::core::rules::RuleTargetKind::Uwp => EditorTargetOption::Uwp,
+        };
 
         let active_rule_dir = match self.active_direction {
             FirewallDirection::Outbound => RuleDirection::Outbound,
@@ -1084,6 +1394,19 @@ impl App {
             self.edit_duration = existing.duration;
             self.edit_service_name = existing.service_name.clone().or_else(|| svc.clone());
             self.edit_apply_to_service = self.edit_service_name.is_some();
+            self.edit_rule_id = existing.rule_id;
+            self.edit_rule_name = existing
+                .display_name
+                .as_deref()
+                .map(|s| {
+                    s.trim()
+                        .strip_prefix("[WSL] ")
+                        .or_else(|| s.trim().strip_prefix("[PORT] "))
+                        .or_else(|| s.trim().strip_prefix("[UWP] "))
+                        .unwrap_or(s.trim())
+                        .to_string()
+                })
+                .unwrap_or_default();
         } else {
             self.edit_action = RuleAction::Allow;
             self.edit_direction = active_rule_dir;
@@ -1094,41 +1417,70 @@ impl App {
             self.edit_remote_ip = None;
             self.edit_service_name = svc.clone();
             self.edit_apply_to_service = svc.is_some();
+            self.edit_rule_id = None;
+            self.edit_rule_name = String::new();
 
-            let summary = self
-                .aggregator
-                .apps
-                .get(&app_key)
-                .or_else(|| self.aggregator.apps.get(&app_path.to_lowercase()));
-
-            if let Some(summary) = summary {
-                if summary.service_name.is_some() {
-                    self.edit_service_name = summary.service_name.clone();
-                    self.edit_apply_to_service = true;
-                }
-                if let Some(last_ev) = summary.recent_events.last() {
-                    self.edit_remote_ip = Some(last_ev.remote_ip.to_string());
-                    self.edit_custom_ip = last_ev.remote_ip.to_string();
-                    self.edit_ports = last_ev.remote_port.to_string();
-                    self.edit_protocol = last_ev.protocol.clone();
+            if let Some(rest) = app_path
+                .strip_prefix("wsl://knock/")
+                .or_else(|| app_path.strip_prefix("WSL://knock/"))
+            {
+                let mut parts = rest.split('/');
+                let p_proto = parts.next().unwrap_or("tcp").to_uppercase();
+                let p_port = parts.next().unwrap_or("80");
+                self.edit_target_option = EditorTargetOption::HyperV;
+                self.edit_protocol = if p_proto == "UDP" || p_proto == "TCP" {
+                    p_proto.clone()
                 } else {
-                    self.edit_ports = summary.all_ports_list();
+                    "ANY".into()
+                };
+                self.edit_ports = p_port.to_string();
+                self.edit_rule_name = format!(
+                    "WSL {} {} {}",
+                    active_rule_dir.label(),
+                    p_port,
+                    self.edit_protocol
+                );
+            } else {
+                let summary = self
+                    .aggregator
+                    .apps
+                    .get(&app_key)
+                    .or_else(|| self.aggregator.apps.get(&app_path.to_lowercase()));
+
+                if let Some(summary) = summary {
+                    if summary.service_name.is_some() {
+                        self.edit_service_name = summary.service_name.clone();
+                        self.edit_apply_to_service = true;
+                    }
+                    if let Some(last_ev) = summary.recent_events.last() {
+                        self.edit_remote_ip = Some(last_ev.remote_ip.to_string());
+                        self.edit_custom_ip = last_ev.remote_ip.to_string();
+                        self.edit_ports = last_ev.remote_port.to_string();
+                        self.edit_protocol = last_ev.protocol.clone();
+                    } else {
+                        self.edit_ports = summary.all_ports_list();
+                        self.edit_protocol = "TCP".into();
+                    }
+                } else {
+                    self.edit_ports = "80,443".into();
                     self.edit_protocol = "TCP".into();
                 }
-            } else {
-                self.edit_ports = "80,443".into();
-                self.edit_protocol = "TCP".into();
             }
         }
     }
 
     pub fn editor_active_fields(&self) -> Vec<RuleEditorField> {
-        let mut fields = vec![
-            RuleEditorField::Action,
-            RuleEditorField::Direction,
-            RuleEditorField::Duration,
-            RuleEditorField::ZoneScope,
-        ];
+        let mut fields = vec![RuleEditorField::TargetKind];
+        if !matches!(
+            self.edit_target_option,
+            EditorTargetOption::App | EditorTargetOption::Uwp
+        ) {
+            fields.push(RuleEditorField::RuleName);
+        }
+        fields.push(RuleEditorField::Action);
+        fields.push(RuleEditorField::Direction);
+        fields.push(RuleEditorField::Duration);
+        fields.push(RuleEditorField::ZoneScope);
         if self.edit_custom_ip_mode {
             fields.push(RuleEditorField::CustomIp);
         }
@@ -1141,7 +1493,7 @@ impl App {
         if proto != NetProtocol::Any {
             fields.push(RuleEditorField::Ports);
         }
-        if self.edit_service_name.is_some() {
+        if self.edit_target_option == EditorTargetOption::App && self.edit_service_name.is_some() {
             fields.push(RuleEditorField::ServiceOnly);
         }
         fields
@@ -1175,6 +1527,40 @@ impl App {
 
     pub fn editor_cycle_option(&mut self, forward: bool) {
         match self.edit_focused_field {
+            RuleEditorField::TargetKind => {
+                let options: &[EditorTargetOption] =
+                    if crate::core::rules::RuleTargetKind::from_app_path(&self.edit_app_path)
+                        == crate::core::rules::RuleTargetKind::App
+                        && !self.edit_app_path.is_empty()
+                    {
+                        &[
+                            EditorTargetOption::App,
+                            EditorTargetOption::PortRule,
+                            EditorTargetOption::HyperV,
+                            EditorTargetOption::BothWinAndHyperV,
+                        ]
+                    } else if self.edit_target_option == EditorTargetOption::Uwp {
+                        &[EditorTargetOption::Uwp]
+                    } else {
+                        &[
+                            EditorTargetOption::PortRule,
+                            EditorTargetOption::HyperV,
+                            EditorTargetOption::BothWinAndHyperV,
+                        ]
+                    };
+                let pos = options
+                    .iter()
+                    .position(|o| *o == self.edit_target_option)
+                    .unwrap_or(0);
+                let next_pos = if forward {
+                    (pos + 1) % options.len()
+                } else if pos == 0 {
+                    options.len() - 1
+                } else {
+                    pos - 1
+                };
+                self.edit_target_option = options[next_pos];
+            }
             RuleEditorField::Action => {
                 self.edit_action = match self.edit_action {
                     RuleAction::Allow => RuleAction::Block,
@@ -1254,7 +1640,7 @@ impl App {
             RuleEditorField::ServiceOnly => {
                 self.edit_apply_to_service = !self.edit_apply_to_service;
             }
-            RuleEditorField::CustomIp | RuleEditorField::Ports => {
+            RuleEditorField::RuleName | RuleEditorField::CustomIp | RuleEditorField::Ports => {
                 // Text fields do not cycle options
             }
         }
@@ -1263,6 +1649,9 @@ impl App {
     pub fn editor_input_char(&mut self, c: char) {
         self.edit_error = None;
         match self.edit_focused_field {
+            RuleEditorField::RuleName => {
+                self.edit_rule_name.push(c);
+            }
             RuleEditorField::CustomIp => {
                 self.edit_custom_ip.push(c);
                 self.edit_remote_ip = Some(self.edit_custom_ip.clone());
@@ -1277,6 +1666,9 @@ impl App {
     pub fn editor_backspace(&mut self) {
         self.edit_error = None;
         match self.edit_focused_field {
+            RuleEditorField::RuleName => {
+                self.edit_rule_name.pop();
+            }
             RuleEditorField::CustomIp => {
                 self.edit_custom_ip.pop();
                 self.edit_remote_ip = if self.edit_custom_ip.is_empty() {
@@ -1302,10 +1694,24 @@ impl App {
     }
 
     pub fn save_prefilled_rule(&mut self) -> bool {
-        if self.edit_app_path.is_empty() {
+        if self.edit_app_path.is_empty()
+            && matches!(
+                self.edit_target_option,
+                EditorTargetOption::App | EditorTargetOption::Uwp
+            )
+        {
             return false;
         }
         if !self.require_admin("Save Rule") {
+            return false;
+        }
+
+        if !matches!(
+            self.edit_target_option,
+            EditorTargetOption::App | EditorTargetOption::Uwp
+        ) && self.edit_rule_name.trim().is_empty()
+        {
+            self.edit_error = Some("Rule name cannot be empty".into());
             return false;
         }
 
@@ -1343,31 +1749,169 @@ impl App {
 
         let now_ts = crate::core::monitor::current_timestamp_secs() as i64;
         let expires_at = self.edit_duration.duration_secs().map(|s| now_ts + s);
+        let trimmed_name = self.edit_rule_name.trim().to_string();
+        let slug = crate::core::firewall::sanitize_rule_slug(&trimmed_name);
 
-        let rule = AppRule {
-            app_path: self.edit_app_path.clone(),
-            service_name: if self.edit_apply_to_service {
-                self.edit_service_name.clone()
-            } else {
-                None
-            },
-            direction: self.edit_direction,
-            action: self.edit_action,
-            zone_scope: self.edit_zone_scope,
-            custom_remote_ip,
-            protocol: proto,
-            ports: validated_ports,
-            interface_name: None,
-            created_at: now_ts,
-            duration: self.edit_duration,
-            expires_at,
-        };
+        let was_knock = self
+            .edit_app_path
+            .to_ascii_lowercase()
+            .starts_with("wsl://knock/");
+        let knock_key =
+            crate::core::rules::make_app_key(&self.edit_app_path, None, self.edit_direction);
 
-        let msg = format!(
-            "Rule Applied: {} ({:?} {:?})",
-            self.edit_app_path, self.edit_direction, self.edit_action
-        );
-        self.apply_rule_internal(rule, &msg);
+        match self.edit_target_option {
+            EditorTargetOption::App | EditorTargetOption::Uwp => {
+                let display_name = if self.edit_target_option == EditorTargetOption::Uwp {
+                    if trimmed_name.is_empty() {
+                        None
+                    } else {
+                        Some(format!("[UWP] {}", trimmed_name))
+                    }
+                } else {
+                    None
+                };
+                let rule = AppRule {
+                    app_path: self.edit_app_path.clone(),
+                    service_name: if self.edit_apply_to_service {
+                        self.edit_service_name.clone()
+                    } else {
+                        None
+                    },
+                    direction: self.edit_direction,
+                    action: self.edit_action,
+                    zone_scope: self.edit_zone_scope,
+                    custom_remote_ip,
+                    protocol: proto,
+                    ports: validated_ports,
+                    interface_name: None,
+                    created_at: now_ts,
+                    duration: self.edit_duration,
+                    expires_at,
+                    display_name,
+                    rule_id: self.edit_rule_id.clone(),
+                    is_system_or_uwp: self.edit_target_option == EditorTargetOption::Uwp,
+                };
+                let msg = format!(
+                    "Rule Applied: {} ({:?} {:?})",
+                    self.edit_app_path, self.edit_direction, self.edit_action
+                );
+                self.apply_rule_internal(rule, &msg);
+            }
+            EditorTargetOption::PortRule => {
+                let (app_path, rule_id) = if self.edit_app_path.starts_with("port://")
+                    && !self.edit_app_path.eq_ignore_ascii_case("port://new-rule")
+                {
+                    (
+                        self.edit_app_path.clone(),
+                        self.edit_rule_id.clone().or_else(|| Some(slug.clone())),
+                    )
+                } else {
+                    (format!("port://{}", slug), Some(slug.clone()))
+                };
+                let rule = AppRule {
+                    app_path: app_path.clone(),
+                    service_name: None,
+                    direction: self.edit_direction,
+                    action: self.edit_action,
+                    zone_scope: self.edit_zone_scope,
+                    custom_remote_ip,
+                    protocol: proto,
+                    ports: validated_ports,
+                    interface_name: None,
+                    created_at: now_ts,
+                    duration: self.edit_duration,
+                    expires_at,
+                    display_name: Some(format!("[PORT] {}", trimmed_name)),
+                    rule_id,
+                    is_system_or_uwp: false,
+                };
+                let msg = format!("Port Rule Applied: {}", trimmed_name);
+                self.selected_app_path = Some(app_path);
+                self.apply_rule_internal(rule, &msg);
+            }
+            EditorTargetOption::HyperV => {
+                let (app_path, rule_id) = if self.edit_app_path.starts_with("wsl://")
+                    && !was_knock
+                    && !self.edit_app_path.eq_ignore_ascii_case("wsl://new-rule")
+                {
+                    (
+                        self.edit_app_path.clone(),
+                        self.edit_rule_id.clone().or_else(|| Some(slug.clone())),
+                    )
+                } else {
+                    (format!("wsl://{}", slug), Some(slug.clone()))
+                };
+                if was_knock {
+                    self.aggregator.apps.remove(&knock_key);
+                }
+                let rule = AppRule {
+                    app_path: app_path.clone(),
+                    service_name: None,
+                    direction: self.edit_direction,
+                    action: self.edit_action,
+                    zone_scope: self.edit_zone_scope,
+                    custom_remote_ip,
+                    protocol: proto,
+                    ports: validated_ports,
+                    interface_name: None,
+                    created_at: now_ts,
+                    duration: self.edit_duration,
+                    expires_at,
+                    display_name: Some(format!("[WSL] {}", trimmed_name)),
+                    rule_id,
+                    is_system_or_uwp: false,
+                };
+                let msg = format!("Hyper-V Rule Applied: {}", trimmed_name);
+                self.selected_app_path = Some(app_path);
+                self.apply_rule_internal(rule, &msg);
+            }
+            EditorTargetOption::BothWinAndHyperV => {
+                if was_knock {
+                    self.aggregator.apps.remove(&knock_key);
+                }
+                let port_rule = AppRule {
+                    app_path: format!("port://{}", slug),
+                    service_name: None,
+                    direction: self.edit_direction,
+                    action: self.edit_action,
+                    zone_scope: self.edit_zone_scope,
+                    custom_remote_ip: custom_remote_ip.clone(),
+                    protocol: proto,
+                    ports: validated_ports.clone(),
+                    interface_name: None,
+                    created_at: now_ts,
+                    duration: self.edit_duration,
+                    expires_at,
+                    display_name: Some(format!("[PORT] {}", trimmed_name)),
+                    rule_id: Some(slug.clone()),
+                    is_system_or_uwp: false,
+                };
+                let wsl_slug = format!("{}-wsl", slug);
+                let wsl_path = format!("wsl://{}", wsl_slug);
+                let hv_rule = AppRule {
+                    app_path: wsl_path.clone(),
+                    service_name: None,
+                    direction: self.edit_direction,
+                    action: self.edit_action,
+                    zone_scope: self.edit_zone_scope,
+                    custom_remote_ip,
+                    protocol: proto,
+                    ports: validated_ports,
+                    interface_name: None,
+                    created_at: now_ts,
+                    duration: self.edit_duration,
+                    expires_at,
+                    display_name: Some(format!("[WSL] {}", trimmed_name)),
+                    rule_id: Some(wsl_slug),
+                    is_system_or_uwp: false,
+                };
+                let msg = format!("Win FW + Hyper-V Rules Applied: {}", trimmed_name);
+                self.apply_rule_internal(port_rule, &msg);
+                self.selected_app_path = Some(wsl_path);
+                self.apply_rule_internal(hv_rule, &msg);
+            }
+        }
+
         self.edit_mode = false;
         true
     }
@@ -1383,20 +1927,100 @@ impl App {
             FirewallDirection::Outbound => RuleDirection::Outbound,
             FirewallDirection::Inbound => RuleDirection::Inbound,
         };
+
+        if let Some(rest) = selected_app_path
+            .strip_prefix("wsl://knock/")
+            .or_else(|| selected_app_path.strip_prefix("WSL://knock/"))
+        {
+            let mut parts = rest.split('/');
+            let proto_raw = parts.next().unwrap_or("tcp").to_ascii_lowercase();
+            let port_str = parts.next().unwrap_or("80");
+            let proto = match proto_raw.as_str() {
+                "tcp" => NetProtocol::Tcp,
+                "udp" => NetProtocol::Udp,
+                _ => NetProtocol::Any,
+            };
+            let dir_slug = match dir {
+                RuleDirection::Outbound => "out",
+                RuleDirection::Inbound => "in",
+            };
+            let slug = format!("itsfw-wsl-{}-{}-{}", dir_slug, proto_raw, port_str);
+            let new_path = format!("wsl://{}", slug);
+            let old_key = crate::core::rules::make_app_key(selected_app_path, None, dir);
+            self.aggregator.apps.remove(&old_key);
+
+            let rule = AppRule {
+                app_path: new_path.clone(),
+                service_name: None,
+                direction: dir,
+                action,
+                zone_scope,
+                custom_remote_ip: None,
+                protocol: proto,
+                ports: port_str.to_string(),
+                interface_name: None,
+                created_at: crate::core::monitor::current_timestamp_secs() as i64,
+                duration: crate::core::rules::RuleDuration::Permanent,
+                expires_at: None,
+                display_name: Some(format!(
+                    "[WSL] {} :{}/{}",
+                    dir.label(),
+                    port_str,
+                    proto_raw.to_uppercase()
+                )),
+                rule_id: Some(slug),
+                is_system_or_uwp: false,
+            };
+            self.selected_app_path = Some(new_path);
+            self.apply_rule_internal(rule, msg);
+            return;
+        }
+
         let svc = self.resolve_service_for_path(selected_app_path);
+        let key = crate::core::rules::make_app_key(selected_app_path, svc.as_deref(), dir);
+        let existing = self.active_rules.get(&key).cloned();
+        let target_kind = crate::core::rules::RuleTargetKind::from_app_path(selected_app_path);
+        let (protocol, ports, custom_remote_ip, display_name, rule_id, is_system_or_uwp) =
+            if let Some(ex) = existing {
+                if target_kind == crate::core::rules::RuleTargetKind::App {
+                    (NetProtocol::Any, "*".into(), None, None, None, false)
+                } else {
+                    (
+                        ex.protocol,
+                        ex.ports,
+                        ex.custom_remote_ip,
+                        ex.display_name,
+                        ex.rule_id,
+                        ex.is_system_or_uwp,
+                    )
+                }
+            } else {
+                (
+                    NetProtocol::Any,
+                    "*".into(),
+                    None,
+                    None,
+                    None,
+                    target_kind == crate::core::rules::RuleTargetKind::Uwp,
+                )
+            };
+
         let rule = AppRule {
             app_path: selected_app_path.to_string(),
             service_name: svc,
             direction: dir,
             action,
             zone_scope,
-            custom_remote_ip: None,
-            protocol: NetProtocol::Any,
-            ports: "*".into(),
+            custom_remote_ip,
+            protocol,
+            ports,
             interface_name: None,
             created_at: crate::core::monitor::current_timestamp_secs() as i64,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name,
+            rule_id,
+            is_system_or_uwp,
         };
 
         self.apply_rule_internal(rule, msg);
@@ -1475,6 +2099,9 @@ impl App {
             created_at: crate::core::monitor::current_timestamp_secs() as i64,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
 
         let msg = format!("Allowed: {}:{}", protocol_str, port);
@@ -1553,6 +2180,14 @@ impl App {
         }
         if let Some(app_item) = self.aggregator.apps.get_mut(&app_key) {
             app_item.is_knocking = false;
+        }
+
+        if matches!(
+            crate::core::rules::RuleTargetKind::from_app_path(app_path),
+            crate::core::rules::RuleTargetKind::HyperV
+                | crate::core::rules::RuleTargetKind::PortRule
+        ) {
+            self.aggregator.sync_firewall_rules(&self.active_rules);
         }
 
         self.set_status(format!("Rule removed (reset to default): {}", app_path));
@@ -1693,6 +2328,9 @@ impl App {
             created_at: crate::core::monitor::current_timestamp_secs() as i64,
             duration: crate::core::rules::RuleDuration::Permanent,
             expires_at: None,
+            display_name: None,
+            rule_id: None,
+            is_system_or_uwp: false,
         };
 
         let action_str = match (action, zone_scope) {
@@ -1847,6 +2485,7 @@ impl App {
             self.active_rules.insert(key, rule.clone());
         }
         self.active_rules.insert(app_key, rule);
+        self.aggregator.sync_firewall_rules(&self.active_rules);
         self.sync_selection();
     }
 }
@@ -1988,6 +2627,9 @@ mod tests {
                 created_at: 100,
                 duration: crate::core::rules::RuleDuration::Permanent,
                 expires_at: None,
+                display_name: None,
+                rule_id: None,
+                is_system_or_uwp: false,
             },
         );
         app.sync_from_os_rules(os_rules);
@@ -2612,5 +3254,145 @@ mod tests {
         assert!(!app.args_modal_open);
         assert_eq!(app.active_pane, ActivePane::ProcessDetails);
         assert!(app.status_message.as_ref().unwrap().0.contains("Copied"));
+    }
+
+    #[test]
+    fn test_system_uwp_toggle_recent_navigation_details_actions_and_new_rule_editor() {
+        let mut app = App::new_with_privilege(true);
+
+        // Add one regular app rule + one UWP rule
+        let mut os_rules = std::collections::HashMap::new();
+        os_rules.insert(
+            "in::wsl://kbot-dev-tcp".into(),
+            AppRule {
+                app_path: "wsl://kbot-dev-tcp".into(),
+                service_name: None,
+                direction: RuleDirection::Inbound,
+                action: RuleAction::Allow,
+                zone_scope: AllowedZoneScope::Both,
+                custom_remote_ip: Some("192.168.128.0/22".into()),
+                protocol: NetProtocol::Tcp,
+                ports: "5300".into(),
+                interface_name: None,
+                created_at: 0,
+                duration: crate::core::rules::RuleDuration::Permanent,
+                expires_at: None,
+                display_name: Some("[WSL] kbot dev tcp".into()),
+                rule_id: Some("kbot-dev-tcp".into()),
+                is_system_or_uwp: false,
+            },
+        );
+        os_rules.insert(
+            "uwp://microsoft.windowsstore_8wekyb3d8bbwe".into(),
+            AppRule {
+                app_path: "uwp://Microsoft.WindowsStore_8wekyb3d8bbwe".into(),
+                service_name: None,
+                direction: RuleDirection::Outbound,
+                action: RuleAction::Allow,
+                zone_scope: AllowedZoneScope::Both,
+                custom_remote_ip: None,
+                protocol: NetProtocol::Any,
+                ports: "*".into(),
+                interface_name: None,
+                created_at: 0,
+                duration: crate::core::rules::RuleDuration::Permanent,
+                expires_at: None,
+                display_name: Some("[UWP] Microsoft Store".into()),
+                rule_id: Some("StoreRule".into()),
+                is_system_or_uwp: true,
+            },
+        );
+        app.sync_from_os_rules(os_rules);
+
+        // Hidden by default
+        assert!(!app.show_system_uwp);
+        assert_eq!(app.visible_apps().len(), 0); // Outbound has only UWP
+        app.toggle_system_uwp();
+        assert!(app.show_system_uwp);
+        assert_eq!(app.visible_apps().len(), 1);
+        app.toggle_system_uwp();
+
+        // Test new rule editor with BothWinAndHyperV
+        app.open_new_rule_editor();
+        assert!(app.edit_mode);
+        assert_eq!(app.edit_focused_field, RuleEditorField::TargetKind);
+        app.edit_target_option = EditorTargetOption::BothWinAndHyperV;
+        app.edit_rule_name = "My Boot Service".into();
+        app.edit_ports = "8080,8443".into();
+        app.edit_direction = RuleDirection::Inbound;
+        assert!(app.save_prefilled_rule());
+        assert!(!app.edit_mode);
+        assert!(app.active_rules.contains_key("in::port://my-boot-service"));
+        assert!(app
+            .active_rules
+            .contains_key("in::wsl://my-boot-service-wsl"));
+
+        // Test WSL knock quick allow
+        app.active_direction = FirewallDirection::Inbound;
+        app.record_incoming_event(NetworkEvent {
+            timestamp: 500,
+            app_path: "wsl://knock/tcp/9999".into(),
+            service_name: None,
+            direction: RuleDirection::Inbound,
+            process_id: 0,
+            parent_process_name: None,
+            remote_ip: IpAddr::from_str("10.0.0.5").unwrap(),
+            remote_port: 9999,
+            protocol: "TCP".into(),
+            is_blocked: true,
+            zone: Zone::Lan,
+        });
+        app.allow_selected_all("wsl://knock/tcp/9999");
+        assert!(app
+            .active_rules
+            .contains_key("in::wsl://itsfw-wsl-in-tcp-9999"));
+
+        // Test Process Details actions & Recent Activity cursor/actions
+        app.active_direction = FirewallDirection::Outbound;
+        let exe_path = r"C:\Tools\mytool.exe";
+        app.aggregator.record_event(NetworkEvent {
+            timestamp: 600,
+            app_path: exe_path.into(),
+            service_name: None,
+            direction: RuleDirection::Outbound,
+            process_id: 777,
+            parent_process_name: Some("wt.exe".into()),
+            remote_ip: IpAddr::from_str("172.16.114.193").unwrap(),
+            remote_port: 443,
+            protocol: "TCP".into(),
+            is_blocked: false,
+            zone: Zone::Lan,
+        });
+        app.sync_selection();
+        app.active_pane = ActivePane::ProcessDetails;
+        app.details_focused_field = ProcessDetailsField::Path;
+        app.execute_details_enter_action();
+        assert!(app
+            .status_message
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("Copied path"));
+        app.execute_details_ctrl_enter_action();
+        assert!(app.status_message.as_ref().unwrap().0.contains("Explorer"));
+
+        app.details_focused_field = ProcessDetailsField::Policy;
+        app.execute_details_ctrl_enter_action();
+        assert!(app.status_message.as_ref().unwrap().0.contains("wf.msc"));
+
+        app.cycle_active_pane();
+        assert_eq!(app.active_pane, ActivePane::RecentActivity);
+        app.copy_selected_recent_activity();
+        assert!(app
+            .status_message
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("Copied endpoint"));
+        app.open_rule_editor_from_recent_event();
+        assert!(app.edit_mode);
+        assert!(app.edit_custom_ip_mode);
+        assert_eq!(app.edit_custom_ip, "172.16.114.193");
+        assert_eq!(app.edit_ports, "443");
     }
 }
