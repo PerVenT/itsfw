@@ -699,7 +699,10 @@ pub fn parse_registry_rule_entry(
     let mut has_local_subnet = false;
     let mut custom_ips: Vec<String> = Vec::new();
     for ra in remote_addrs {
-        if ra.eq_ignore_ascii_case("LocalSubnet") {
+        if ra.eq_ignore_ascii_case("LocalSubnet")
+            || ra.eq_ignore_ascii_case("LocalSubnet4")
+            || ra.eq_ignore_ascii_case("LocalSubnet6")
+        {
             has_local_subnet = true;
         } else if ra != "*" && !ra.eq_ignore_ascii_case("Any") {
             if let Some(norm) = normalize_registry_ra4(&ra) {
@@ -712,13 +715,29 @@ pub fn parse_registry_rule_entry(
         }
     }
 
-    let (zone_scope, custom_remote_ip) = if has_local_subnet && custom_ips.is_empty() {
-        (AllowedZoneScope::LanOnly, None)
-    } else if !custom_ips.is_empty() {
-        (AllowedZoneScope::Both, Some(custom_ips.join(",")))
-    } else {
-        (AllowedZoneScope::Both, None)
+    let is_standard_lan_cidr = |ip: &str| {
+        matches!(
+            ip.to_ascii_lowercase().as_str(),
+            "10.0.0.0/8"
+                | "172.16.0.0/12"
+                | "192.168.0.0/16"
+                | "169.254.0.0/16"
+                | "100.64.0.0/10"
+                | "fc00::/7"
+                | "fe80::/10"
+        )
     };
+    let all_custom_are_lan =
+        !custom_ips.is_empty() && custom_ips.iter().all(|s| is_standard_lan_cidr(s));
+
+    let (zone_scope, custom_remote_ip) =
+        if has_local_subnet && (custom_ips.is_empty() || all_custom_are_lan) {
+            (AllowedZoneScope::LanOnly, None)
+        } else if !custom_ips.is_empty() {
+            (AllowedZoneScope::Both, Some(custom_ips.join(",")))
+        } else {
+            (AllowedZoneScope::Both, None)
+        };
 
     Some(AppRule {
         app_path,
@@ -920,30 +939,42 @@ pub fn build_hyperv_powershell_upsert_cmd(rule_id: &str, params: &FirewallRulePa
         }
     }
 
+    cmd.push_str(" -ErrorAction Stop");
     cmd
 }
 
 #[cfg(windows)]
-fn spawn_powershell_background(ps_cmd: String) {
+fn run_powershell_sync(ps_cmd: &str) -> anyhow::Result<()> {
     if cfg!(test) {
-        return;
+        return Ok(());
     }
-    std::thread::spawn(move || {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _ = Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                &ps_cmd,
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-    });
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps_cmd,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit code {:?}", output.status.code())
+        };
+        anyhow::bail!("Hyper-V Firewall PowerShell failed: {}", detail);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1095,39 +1126,6 @@ fn lookup_uwp_rule_names_by_pfn(pfn: &str, target_dir: RuleDirection) -> Vec<Str
         }
     });
     names
-}
-
-#[cfg(windows)]
-fn write_hyperv_registry_rule(value_name: &str, reg_sz_value: &str) -> anyhow::Result<()> {
-    use windows::core::HSTRING;
-    use windows::Win32::Foundation::ERROR_SUCCESS;
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_SZ,
-    };
-    let subkey = windows::core::w!(
-        "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\HyperVRules"
-    );
-    let mut hkey = HKEY::default();
-    let open_err =
-        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, Some(0), KEY_WRITE, &mut hkey) };
-    if open_err != ERROR_SUCCESS {
-        anyhow::bail!("Failed to open HyperVRules registry key: {:?}", open_err);
-    }
-    let wide_val: Vec<u16> = reg_sz_value
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let byte_slice =
-        unsafe { std::slice::from_raw_parts(wide_val.as_ptr() as *const u8, wide_val.len() * 2) };
-    let name_hstr = HSTRING::from(value_name);
-    let set_err = unsafe { RegSetValueExW(hkey, &name_hstr, None, REG_SZ, Some(byte_slice)) };
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    }
-    if set_err != ERROR_SUCCESS {
-        anyhow::bail!("Failed to write HyperVRules registry value: {:?}", set_err);
-    }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -1708,13 +1706,19 @@ impl FirewallBackend for ComFirewallBackend {
     fn apply_rule(&self, params: &FirewallRuleParams) -> anyhow::Result<()> {
         match RuleTargetKind::from_app_path(&params.app_path) {
             RuleTargetKind::HyperV => {
-                let (rule_id, reg_val) = build_hyperv_registry_rule_string(params);
+                let (rule_id, _) = build_hyperv_registry_rule_string(params);
                 if cfg!(test) {
                     return Ok(());
                 }
-                write_hyperv_registry_rule(&rule_id, &reg_val)?;
                 let ps_cmd = build_hyperv_powershell_upsert_cmd(&rule_id, params);
-                spawn_powershell_background(ps_cmd);
+                if let Err(first_err) = run_powershell_sync(&ps_cmd) {
+                    // Self-heal: if an orphaned stale registry entry existed outside mpssvc, remove it and retry once.
+                    if delete_hyperv_registry_rule(&rule_id).is_ok() {
+                        run_powershell_sync(&ps_cmd)?;
+                    } else {
+                        return Err(first_err);
+                    }
+                }
                 return Ok(());
             }
             RuleTargetKind::Uwp => {
@@ -1806,12 +1810,16 @@ impl FirewallBackend for ComFirewallBackend {
                 if slug.starts_with("knock/") {
                     return Ok(0);
                 }
-                let removed = delete_hyperv_registry_rule(slug).is_ok();
                 let escaped = escape_ps_single_quoted(slug);
-                spawn_powershell_background(format!(
-                    "Remove-NetFirewallHyperVRule -Name '{}' -ErrorAction SilentlyContinue",
+                let ps_cmd = format!(
+                    "Remove-NetFirewallHyperVRule -Name '{}' -ErrorAction Stop",
                     escaped
-                ));
+                );
+                if run_powershell_sync(&ps_cmd).is_ok() {
+                    return Ok(1);
+                }
+                // Fallback: clean up orphaned stale registry value if mpssvc didn't know about it
+                let removed = delete_hyperv_registry_rule(slug).is_ok();
                 return Ok(if removed { 1 } else { 0 });
             }
             RuleTargetKind::PortRule => {
@@ -3255,5 +3263,18 @@ Action:                               Block
         assert!(built_reg.contains("LPort=5300|LPort=443|LPort=6443|"));
         assert!(built_reg.contains("RA4=192.168.128.0/255.255.252.0|"));
         assert!(built_reg.contains("Name=kbot dev tcp|"));
+
+        let ps_cmd = build_hyperv_powershell_upsert_cmd(&rule_id, &params);
+        assert!(ps_cmd.contains("New-NetFirewallHyperVRule"));
+        assert!(ps_cmd.contains("-ErrorAction Stop"));
+        assert!(ps_cmd.contains("-LocalPorts @('5300','443','6443')"));
+
+        // Verify LAN-only Hyper-V rule with LocalSubnet + standard LAN CIDRs parses as LanOnly
+        let lan_raw = "v2.33|Action=Allow|Active=TRUE|Dir=Out|VMCreatorId={40E0AC32-46A5-438A-A0B2-2B479E8F2E90}|Protocol=17|RPort=53|RPort=67|RPort=123|RA4=LocalSubnet4|RA4=10.0.0.0/255.0.0.0|RA4=172.16.0.0/255.240.0.0|RA4=192.168.0.0/255.255.0.0|RA6=fe80::/10|Name=allow-dhcp-dns-ntp|";
+        let lan_rule = parse_registry_rule_entry("allow-dhcp-dns-ntp", lan_raw, true)
+            .expect("should parse LAN Hyper-V rule");
+        assert_eq!(lan_rule.zone_scope, AllowedZoneScope::LanOnly);
+        assert_eq!(lan_rule.custom_remote_ip, None);
+        assert_eq!(lan_rule.ports, "53,67,123");
     }
 }

@@ -1123,56 +1123,70 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     .fg(palette.lan_yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("switch mode │ "),
+            Span::raw("mode  "),
+            Span::styled(
+                "[f] ",
+                Style::default()
+                    .fg(palette.warning_orange)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("policy  "),
+            Span::styled(
+                "[n] ",
+                Style::default()
+                    .fg(palette.internet_cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("new  "),
             Span::styled(
                 "[a] ",
                 Style::default()
                     .fg(palette.allowed_green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("allow │ "),
+            Span::raw("allow  "),
             Span::styled(
                 "[l] ",
                 Style::default()
                     .fg(palette.lan_yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("lan only │ "),
+            Span::raw("lan  "),
             Span::styled(
                 "[i] ",
                 Style::default()
                     .fg(palette.internet_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("int only │ "),
+            Span::raw("wan  "),
             Span::styled(
                 "[d] ",
                 Style::default()
                     .fg(palette.alert_red)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("deny │ "),
+            Span::raw("deny  "),
             Span::styled(
                 "[x] ",
                 Style::default()
                     .fg(palette.warning_orange)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("reset │ "),
+            Span::raw("reset  "),
             Span::styled(
                 "[/] ",
                 Style::default()
                     .fg(palette.internet_cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("search │ "),
+            Span::raw("find  "),
             Span::styled(
                 "[s] ",
                 Style::default()
                     .fg(palette.lan_yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("sort │ "),
+            Span::raw("sort  "),
             Span::styled(
                 "[q] ",
                 Style::default()
@@ -2203,9 +2217,11 @@ mod tests {
         let mut app = App::new_with_privilege(true);
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let out_admin = buffer_to_string(terminal.backend().buffer());
+        assert!(out_admin.contains("[f] policy"));
+        assert!(out_admin.contains("[n] new"));
         assert!(out_admin.contains("allow"));
-        assert!(out_admin.contains("lan only"));
-        assert!(out_admin.contains("switch mode"));
+        assert!(out_admin.contains("lan"));
+        assert!(out_admin.contains("mode"));
         assert!(out_admin.contains("quit"));
 
         // Read-only mode
@@ -2214,7 +2230,7 @@ mod tests {
         let out_ro = buffer_to_string(terminal.backend().buffer());
         assert!(out_ro.contains("[READ-ONLY]"));
         assert!(out_ro.contains("filter"));
-        assert!(!out_ro.contains("lan only"));
+        assert!(!out_ro.contains("[f] policy"));
     }
 
     #[test]

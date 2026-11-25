@@ -73,8 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let os_rules = crate::core::firewall::WindowsFirewallManager::load_all_rules_from_os();
     app.sync_from_os_rules(os_rules);
 
-    // 2. Ініціалізуємо WFP Drop Monitor та Registry Watcher
+    // 2. Ініціалізуємо WFP Drop Monitor, WSL SYN_SENT Monitor та Registry Watcher
     let mut wfp_monitor = WfpDropMonitor::new();
+    let wsl_monitor = crate::core::scanner::WslSynSentMonitor::start();
     let watcher = crate::core::watcher::FirewallRegistryWatcher::start();
     app.set_watcher(watcher.clone());
 
@@ -94,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut terminal,
         &mut app,
         &mut wfp_monitor,
+        &wsl_monitor,
         &watcher,
         &etw_monitor,
     );
@@ -119,6 +121,7 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     wfp_monitor: &mut WfpDropMonitor,
+    wsl_monitor: &crate::core::scanner::WslSynSentMonitor,
     watcher: &crate::core::watcher::FirewallRegistryWatcher,
     etw_monitor: &crate::core::etw::EtwNetworkMonitor,
 ) -> io::Result<()>
@@ -162,6 +165,9 @@ where
                 }
                 for drop_ev in wfp_monitor.poll_dropped_events() {
                     app.record_incoming_event(drop_ev);
+                }
+                for wsl_ev in wsl_monitor.drain_events() {
+                    app.record_incoming_event(wsl_ev);
                 }
                 app.sync_selection();
             }
